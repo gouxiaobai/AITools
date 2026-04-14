@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import io
 import json
 import os
@@ -18,10 +18,13 @@ if SRC_DIR not in sys.path:
 from stock_pipeline import (  # noqa: E402
     NotionClient,
     backtest_recommendation,
+    history_query,
     load_cfg,
     load_dotenv,
     recommend_prices,
+    snapshot_daily,
     sync_prices,
+    sync_snapshot_notion,
 )
 
 
@@ -31,9 +34,7 @@ def _run_and_capture(fn, *args, **kwargs) -> Tuple[int, str, Optional[Any], Opti
         with redirect_stdout(buffer):
             code = fn(*args, **kwargs)
         raw = buffer.getvalue().strip()
-        parsed = None
-        if raw:
-            parsed = json.loads(raw)
+        parsed = json.loads(raw) if raw else None
         return int(code), raw, parsed, None
     except Exception as exc:
         return 1, buffer.getvalue().strip(), None, str(exc)
@@ -43,7 +44,7 @@ def _init_client(token_override: str, notion_version: str) -> Tuple[Optional[Not
     load_dotenv(os.path.join(ROOT_DIR, ".env"))
     token = token_override.strip() or os.getenv("NOTION_TOKEN", "").strip()
     if not token:
-        return None, "未检测到 NOTION_TOKEN。请先在 .env 配置，或在左侧输入 Token。"
+        return None, "未检测到 NOTION_TOKEN，请先在 .env 配置或在左侧输入 Token。"
     return NotionClient(token=token, version=notion_version), None
 
 
@@ -77,7 +78,7 @@ def _as_df(items: Any) -> pd.DataFrame:
 
 
 def _show_json_debug(title: str, raw: str) -> None:
-    with st.expander(f"{title}（调试 JSON）", expanded=False):
+    with st.expander(f"{title}（JSON）", expanded=False):
         st.code(raw or "(empty)", language="json")
 
 
@@ -100,32 +101,7 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
         c2.metric("BUY", int((df.get("action", pd.Series()) == "BUY").sum()) if "action" in df else 0)
         c3.metric("SELL", int((df.get("action", pd.Series()) == "SELL").sum()) if "action" in df else 0)
         c4.metric("HOLD", int((df.get("action", pd.Series()) == "HOLD").sum()) if "action" in df else 0)
-
-        f1, f2 = st.columns([1, 1])
-        conf_opts = sorted(df["confidence"].dropna().unique().tolist()) if "confidence" in df.columns else []
-        action_opts = sorted(df["action"].dropna().unique().tolist()) if "action" in df.columns else []
-        conf_filter = f1.multiselect("筛选置信度", conf_opts, default=conf_opts, key="conf_filter")
-        action_filter = f2.multiselect("筛选动作", action_opts, default=action_opts, key="action_filter")
-
-        if "confidence" in df.columns:
-            df = df[df["confidence"].isin(conf_filter)]
-        if "action" in df.columns:
-            df = df[df["action"].isin(action_filter)]
-        sort_cols: List[str] = [c for c in ["confidence", "action", "sample_count"] if c in df.columns]
-        if sort_cols:
-            df = df.sort_values(by=sort_cols, ascending=[True] * len(sort_cols))
         st.dataframe(df, use_container_width=True, hide_index=True)
-        if {"stock_name", "strategy_id", "action"}.issubset(df.columns):
-            show_cols = [c for c in ["action", "buy_price", "sell_price", "stop_price", "confidence", "sample_count"] if c in df.columns]
-            if show_cols:
-                compare = (
-                    df[["stock_name", "strategy_id"] + show_cols]
-                    .pivot_table(index="stock_name", columns="strategy_id", values=show_cols, aggfunc="first")
-                )
-                compare.columns = [f"{s}_{k}" for k, s in compare.columns]
-                compare = compare.reset_index()
-                st.subheader("策略对比视图（按股票并排）")
-                st.dataframe(compare, use_container_width=True, hide_index=True)
     _show_json_debug("交易建议结果", raw)
 
 
@@ -133,70 +109,70 @@ def _render_backtest_result(parsed: Optional[Any], raw: str) -> None:
     if isinstance(parsed, dict):
         baseline = parsed.get("baseline", {}) if isinstance(parsed.get("baseline"), dict) else {}
         strategy = parsed.get("strategy_all", {}) if isinstance(parsed.get("strategy_all"), dict) else {}
-        by_mode = parsed.get("strategy_by_mode", {}) if isinstance(parsed.get("strategy_by_mode"), dict) else {}
-        by_strategy = parsed.get("strategy_metrics", {}) if isinstance(parsed.get("strategy_metrics"), dict) else {}
-        by_strategy_mode = parsed.get("strategy_mode_metrics", {}) if isinstance(parsed.get("strategy_mode_metrics"), dict) else {}
-
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("基线 Sharpe-like", f"{baseline.get('sharpe_like', 0):.4f}")
         c2.metric("策略 Sharpe-like", f"{strategy.get('sharpe_like', 0):.4f}")
         c3.metric("基线回撤", f"{baseline.get('max_drawdown', 0):.4f}")
         c4.metric("策略回撤", f"{strategy.get('max_drawdown', 0):.4f}")
-
-        mode_rows = []
-        for mode, metric in by_mode.items():
-            row = {"mode": mode}
-            if isinstance(metric, dict):
-                row.update(metric)
-            mode_rows.append(row)
-        if mode_rows:
-            st.subheader("按模式对比")
-            st.dataframe(pd.DataFrame(mode_rows), use_container_width=True, hide_index=True)
-
-        strategy_rows = []
-        for sid, metric in by_strategy.items():
-            row = {"strategy_id": sid}
-            if isinstance(metric, dict):
-                row.update(metric)
-            strategy_rows.append(row)
-        if strategy_rows:
-            st.subheader("按策略对比")
-            st.dataframe(pd.DataFrame(strategy_rows), use_container_width=True, hide_index=True)
-
-        strategy_mode_rows = []
-        for key, metric in by_strategy_mode.items():
-            row = {"strategy_mode": key}
-            if isinstance(metric, dict):
-                row.update(metric)
-            strategy_mode_rows.append(row)
-        if strategy_mode_rows:
-            st.subheader("按策略+模式对比")
-            st.dataframe(pd.DataFrame(strategy_mode_rows), use_container_width=True, hide_index=True)
-
-        st.subheader("总体对比")
-        compare_rows = [
-            {"bucket": "baseline", **baseline},
-            {"bucket": "strategy_all", **strategy},
-        ]
-        st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
+        st.dataframe(_as_df(parsed.get("strategy_metrics", {})), use_container_width=True)
     _show_json_debug("回测结果", raw)
+
+
+def _render_history_result(parsed: Optional[Any], raw: str) -> None:
+    if not isinstance(parsed, dict):
+        _show_json_debug("历史查询结果", raw)
+        return
+    summary = parsed.get("summary", {}) if isinstance(parsed.get("summary"), dict) else {}
+    by_day = parsed.get("by_day", []) if isinstance(parsed.get("by_day"), list) else []
+    by_strategy = parsed.get("by_strategy", []) if isinstance(parsed.get("by_strategy"), list) else []
+    by_market = parsed.get("by_market", []) if isinstance(parsed.get("by_market"), list) else []
+    rows = parsed.get("rows", []) if isinstance(parsed.get("rows"), list) else []
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("累计收益", f"{summary.get('return_sum', 0):.4f}")
+    c2.metric("回撤曲线", f"{summary.get('max_drawdown_curve', 0):.4f}")
+    c3.metric("命中率", f"{summary.get('hit_rate', 0):.2%}")
+    c4.metric("样本数", int(summary.get("count", 0)))
+
+    if by_day:
+        day_df = pd.DataFrame(by_day)
+        st.subheader("按天趋势")
+        if {"snapshot_date", "return_mean"}.issubset(day_df.columns):
+            st.line_chart(day_df[["snapshot_date", "return_mean"]].set_index("snapshot_date"))
+        st.dataframe(day_df, use_container_width=True, hide_index=True)
+
+    c5, c6 = st.columns(2)
+    if by_strategy:
+        c5.subheader("按策略对比")
+        c5.dataframe(pd.DataFrame(by_strategy), use_container_width=True, hide_index=True)
+    if by_market:
+        c6.subheader("按市场对比")
+        c6.dataframe(pd.DataFrame(by_market), use_container_width=True, hide_index=True)
+
+    if rows:
+        st.subheader("策略-股票明细")
+        rows_df = pd.DataFrame(rows)
+        st.dataframe(rows_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "导出明细 CSV",
+            data=rows_df.to_csv(index=False).encode("utf-8"),
+            file_name="strategy_snapshot_rows.csv",
+            mime="text/csv",
+        )
+    _show_json_debug("历史查询结果", raw)
 
 
 def main() -> None:
     st.set_page_config(page_title="股票策略控制台", layout="wide")
-    st.title("股票策略平台控制台")
-    st.caption("手动执行日频流程：实时行情同步 -> 建议生成 -> 回测分析")
+    st.title("股票策略控制台")
+    st.caption("实时行情 -> 建议生成 -> 回测分析 -> 历史追踪")
 
     with st.sidebar:
         st.header("全局配置")
         token_input = st.text_input("NOTION_TOKEN（可留空走 .env）", type="password")
         notion_version = st.text_input("Notion-Version", value=os.getenv("NOTION_VERSION", "2022-06-28"))
         min_conf = st.selectbox("最小置信度", options=["LOW", "MEDIUM", "HIGH"], index=1)
-        strategy_set = st.multiselect(
-            "并行策略",
-            options=["baseline", "chan", "atr_wave"],
-            default=["baseline", "chan", "atr_wave"],
-        )
+        strategy_set = st.multiselect("并行策略", options=["baseline", "chan", "atr_wave"], default=["baseline", "chan", "atr_wave"])
         timeout = st.number_input("行情请求超时（秒）", min_value=3, max_value=30, value=8, step=1)
 
     client, err = _init_client(token_input, notion_version)
@@ -209,7 +185,7 @@ def main() -> None:
         st.stop()
 
     _show_run_status()
-    tab_price, tab_signal, tab_backtest = st.tabs(["实时行情", "交易建议", "回测分析"])
+    tab_price, tab_signal, tab_backtest, tab_history = st.tabs(["实时行情", "交易建议", "回测分析", "历史追踪"])
 
     with tab_price:
         st.subheader("实时行情同步")
@@ -227,30 +203,10 @@ def main() -> None:
                 _render_sync_result(parsed, raw)
 
     with tab_signal:
-        st.subheader("交易建议（串行流程）")
-        st.caption("步骤 1 -> 步骤 2 -> 步骤 3，任一步失败将阻断后续步骤。")
-        allow_small_sample = st.toggle("允许小样本建议（<20笔）", value=True, key="tab_allow_small")
+        st.subheader("交易建议")
+        allow_small_sample = st.toggle("允许小样本建议（<20）", value=True, key="tab_allow_small")
         dry_rec = st.checkbox("仅预览，不写入 Notion（dry-run）", value=True, key="tab_rec_dry")
-        auto_sync = st.checkbox("步骤1自动执行价格同步", value=True, key="tab_auto_sync")
-
-        step1_btn, step2_btn, step3_btn = st.columns(3)
-        run_sync = step1_btn.button("步骤1：同步价格", use_container_width=True)
-        run_recommend = step2_btn.button("步骤2：生成建议", use_container_width=True)
-        run_pipeline = step3_btn.button("步骤3：一键串行执行", use_container_width=True)
-
-        if run_sync:
-            args = argparse.Namespace(dry_run=dry_rec, timeout=int(timeout))
-            code, raw, parsed, run_err = _run_and_capture(sync_prices, client, cfg, args)
-            if run_err or code != 0:
-                msg = run_err or raw or "步骤1失败：价格同步失败"
-                st.error(msg)
-                _mark_run("步骤1 同步价格", False, msg)
-            else:
-                st.success("步骤1完成")
-                _mark_run("步骤1 同步价格", True, "价格同步成功")
-                _render_sync_result(parsed, raw)
-
-        if run_recommend:
+        if st.button("执行建议生成", type="primary", use_container_width=True):
             rec_args = argparse.Namespace(
                 dry_run=dry_rec,
                 asof_date="",
@@ -259,72 +215,23 @@ def main() -> None:
                 strategy_set=",".join(strategy_set),
                 refresh_prices=False,
                 timeout=int(timeout),
+                emit_snapshot=False,
+                snapshot_date="",
             )
             code, raw, parsed, run_err = _run_and_capture(recommend_prices, client, cfg, rec_args)
             if run_err or code != 0:
-                msg = run_err or raw or "步骤2失败：建议生成失败"
+                msg = run_err or raw or "建议生成失败"
                 st.error(msg)
-                _mark_run("步骤2 生成建议", False, msg)
+                _mark_run("建议生成", False, msg)
             else:
-                st.success("步骤2完成")
-                _mark_run("步骤2 生成建议", True, "建议生成成功")
+                st.success("建议生成完成")
+                _mark_run("建议生成", True, "建议结果已更新")
                 _render_recommend_result(parsed, raw)
-
-        if run_pipeline:
-            ok = True
-            if auto_sync:
-                sync_args = argparse.Namespace(dry_run=dry_rec, timeout=int(timeout))
-                s_code, s_raw, s_parsed, s_err = _run_and_capture(sync_prices, client, cfg, sync_args)
-                if s_err or s_code != 0:
-                    msg = s_err or s_raw or "步骤1失败：价格同步失败"
-                    st.error(msg)
-                    _mark_run("串行流程", False, msg)
-                    ok = False
-                else:
-                    st.success("步骤1完成")
-                    _render_sync_result(s_parsed, s_raw)
-
-            if ok:
-                rec_args = argparse.Namespace(
-                    dry_run=dry_rec,
-                    asof_date="",
-                    allow_small_sample=allow_small_sample,
-                    min_confidence=min_conf,
-                    strategy_set=",".join(strategy_set),
-                    refresh_prices=False,
-                    timeout=int(timeout),
-                )
-                r_code, r_raw, r_parsed, r_err = _run_and_capture(recommend_prices, client, cfg, rec_args)
-                if r_err or r_code != 0:
-                    msg = r_err or r_raw or "步骤2失败：建议生成失败"
-                    st.error(msg)
-                    _mark_run("串行流程", False, msg)
-                    ok = False
-                else:
-                    st.success("步骤2完成")
-                    _render_recommend_result(r_parsed, r_raw)
-
-            if ok:
-                bt_args = argparse.Namespace(
-                    window=60,
-                    allow_small_sample=allow_small_sample,
-                    min_confidence=min_conf,
-                    strategy_set=",".join(strategy_set),
-                )
-                b_code, b_raw, b_parsed, b_err = _run_and_capture(backtest_recommendation, client, cfg, bt_args)
-                if b_err or b_code != 0:
-                    msg = b_err or b_raw or "步骤3失败：回测失败"
-                    st.error(msg)
-                    _mark_run("串行流程", False, msg)
-                else:
-                    st.success("步骤3完成")
-                    _mark_run("串行流程", True, "步骤1-3执行成功")
-                    _render_backtest_result(b_parsed, b_raw)
 
     with tab_backtest:
         st.subheader("回测分析")
         window = st.number_input("回测窗口（交易事件）", min_value=10, max_value=240, value=60, step=5)
-        allow_small_sample_bt = st.toggle("回测允许小样本建议", value=True, key="bt_allow_small")
+        allow_small_sample_bt = st.toggle("允许小样本", value=True, key="bt_allow_small")
         if st.button("执行回测", type="primary", use_container_width=True):
             bt_args = argparse.Namespace(
                 window=int(window),
@@ -334,16 +241,83 @@ def main() -> None:
             )
             code, raw, parsed, run_err = _run_and_capture(backtest_recommendation, client, cfg, bt_args)
             if run_err or code != 0:
-                msg = run_err or raw or "回测执行失败"
+                msg = run_err or raw or "回测失败"
                 st.error(msg)
-                _mark_run("回测分析", False, msg)
+                _mark_run("回测", False, msg)
             else:
                 st.success("回测完成")
-                _mark_run("回测分析", True, "回测执行成功")
+                _mark_run("回测", True, "回测结果已更新")
                 _render_backtest_result(parsed, raw)
 
+    with tab_history:
+        st.subheader("每日快照与历史趋势")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        c1, c2 = st.columns(2)
+        snapshot_date = c1.text_input("快照日期", value=today_str, key="snapshot_date")
+        sync_dry = c2.checkbox("Notion 同步 dry-run", value=True, key="snapshot_notion_dry")
+
+        b1, b2 = st.columns(2)
+        if b1.button("手动落库快照", use_container_width=True):
+            snap_args = argparse.Namespace(
+                dry_run=False,
+                snapshot_date=snapshot_date,
+                allow_small_sample=True,
+                min_confidence=min_conf,
+                strategy_set=",".join(strategy_set),
+                refresh_prices=False,
+                timeout=int(timeout),
+            )
+            code, raw, parsed, run_err = _run_and_capture(snapshot_daily, client, cfg, snap_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "快照落库失败"
+                st.error(msg)
+                _mark_run("快照落库", False, msg)
+            else:
+                st.success("快照落库完成")
+                _mark_run("快照落库", True, "SQLite 快照已更新")
+                st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("快照落库结果", raw)
+
+        if b2.button("同步当日快照到 Notion", use_container_width=True):
+            sync_args = argparse.Namespace(snapshot_date=snapshot_date, dry_run=sync_dry)
+            code, raw, parsed, run_err = _run_and_capture(sync_snapshot_notion, client, cfg, sync_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "Notion 同步失败"
+                st.error(msg)
+                _mark_run("同步快照Notion", False, msg)
+            else:
+                st.success("Notion 同步完成")
+                _mark_run("同步快照Notion", True, "Notion 策略快照库已更新")
+                st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("Notion 同步结果", raw)
+
+        st.markdown("---")
+        st.subheader("历史查询")
+        c3, c4 = st.columns(2)
+        start_date = c3.text_input("开始日期", value=today_str, key="hist_start")
+        end_date = c4.text_input("结束日期", value=today_str, key="hist_end")
+        c5, c6 = st.columns(2)
+        strategy_filter = c5.multiselect("策略过滤", options=["BASELINE", "CHAN", "ATR_WAVE"], default=[])
+        market_filter = c6.multiselect("市场过滤", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
+        if st.button("查询历史趋势", type="primary", use_container_width=True):
+            h_args = argparse.Namespace(
+                start_date=start_date,
+                end_date=end_date,
+                strategies=",".join(strategy_filter),
+                markets=",".join(market_filter),
+            )
+            code, raw, parsed, run_err = _run_and_capture(history_query, h_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "历史查询失败"
+                st.error(msg)
+                _mark_run("历史查询", False, msg)
+            else:
+                st.success("历史查询完成")
+                _mark_run("历史查询", True, "历史趋势已刷新")
+                _render_history_result(parsed, raw)
+
     st.markdown("---")
-    st.caption("建议：先在“实时行情”执行同步，再到“交易建议”执行串行流程，最后在“回测分析”查看稳定性。")
+    st.caption("建议：先同步实时行情，再生成建议，最后做快照与历史查询。")
 
 
 if __name__ == "__main__":

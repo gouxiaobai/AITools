@@ -73,6 +73,18 @@ python src\stock_pipeline.py backtest-recommendation --window 60 --min-confidenc
 # 11) Run parallel strategies (BASELINE + CHAN + ATR_WAVE)
 python src\stock_pipeline.py recommend-prices --dry-run --strategy-set baseline,chan,atr_wave
 python src\stock_pipeline.py backtest-recommendation --window 60 --strategy-set baseline,chan,atr_wave
+
+# 12) Emit daily snapshot to local SQLite
+python src\stock_pipeline.py snapshot-daily --snapshot-date 2026-04-14
+
+# 13) Emit snapshot directly after recommendation
+python src\stock_pipeline.py recommend-prices --emit-snapshot --snapshot-date 2026-04-14
+
+# 14) Sync one-day snapshot to Notion strategy snapshot DB
+python src\stock_pipeline.py sync-snapshot-notion --snapshot-date 2026-04-14
+
+# 15) Query history from SQLite
+python src\stock_pipeline.py history-query --start-date 2026-04-01 --end-date 2026-04-14 --strategies BASELINE,CHAN --markets SH,SZ
 ```
 
 ## Visual Dashboard
@@ -100,6 +112,9 @@ Override by setting env vars in `.env`:
 - `DB_ANNUAL_ID`
 - `DB_BUY_WIDE_ID`
 - `DB_T_RECORD_ID`
+- `DB_STRATEGY_SNAPSHOT_ID`
+- `SQLITE_PATH` (default: `./data/strategy_snapshots.db`)
+- `SNAPSHOT_MARKET_RULE` (optional, e.g. `60:SH,00:SZ,30:SZ`)
 
 ## 2) Commands
 

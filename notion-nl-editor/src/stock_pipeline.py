@@ -1,16 +1,19 @@
-import argparse
+﻿import argparse
 import datetime as dt
 import json
 import math
 import os
+import sqlite3
 import statistics
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from uuid import uuid4
 
 import requests
+from requests import exceptions as req_exc
 
 
 def load_dotenv(path: str) -> None:
@@ -36,15 +39,25 @@ class NotionClient:
             "Notion-Version": version,
             "Content-Type": "application/json",
         }
+        self.session = requests.Session()
+        self.max_retries = int(os.getenv("NOTION_HTTP_RETRIES", "4"))
+        self.retry_backoff = float(os.getenv("NOTION_HTTP_RETRY_BACKOFF", "0.8"))
 
     def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base}{path}"
-        resp = requests.request(method, url, headers=self.headers, json=payload, timeout=30)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Notion API error {resp.status_code} {path}: {resp.text}")
-        if not resp.text:
-            return {}
-        return resp.json()
+        attempts = max(self.max_retries, 1)
+        for i in range(attempts):
+            try:
+                resp = self.session.request(method, url, headers=self.headers, json=payload, timeout=30)
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Notion API error {resp.status_code} {path}: {resp.text}")
+                if not resp.text:
+                    return {}
+                return resp.json()
+            except (req_exc.SSLError, req_exc.ConnectionError, req_exc.Timeout) as e:
+                if i == attempts - 1:
+                    raise RuntimeError(f"Notion request failed after {attempts} attempts {path}: {e}") from e
+                time.sleep(self.retry_backoff * (2**i))
 
     def get_database(self, database_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/databases/{database_id}")
@@ -141,6 +154,7 @@ class Cfg:
     annual_id: str
     buy_wide_id: str
     t_record_id: str
+    strategy_snapshot_id: str
 
 
 def load_cfg() -> Cfg:
@@ -151,7 +165,195 @@ def load_cfg() -> Cfg:
         annual_id=os.getenv("DB_ANNUAL_ID", "33c225a4-e273-8162-8804-dfde58582535"),
         buy_wide_id=os.getenv("DB_BUY_WIDE_ID", "0d485b47-e903-4fd3-901e-1bb4d09200f1"),
         t_record_id=os.getenv("DB_T_RECORD_ID", "93dde4b0-5d6f-4c49-a825-e49ae95be420"),
+        strategy_snapshot_id=os.getenv("DB_STRATEGY_SNAPSHOT_ID", ""),
     )
+
+
+def _sqlite_path() -> str:
+    raw = os.getenv("SQLITE_PATH", "./data/strategy_snapshots.db")
+    return os.path.abspath(raw)
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _today_or(raw: str) -> str:
+    date_text = (raw or "").strip()
+    if not date_text:
+        return dt.date.today().isoformat()
+    dt.datetime.strptime(date_text, "%Y-%m-%d")
+    return date_text
+
+
+def _guess_market(stock_code: str) -> str:
+    code = (stock_code or "").strip().upper()
+    digits = "".join(ch for ch in code if ch.isdigit())
+    if len(digits) == 6:
+        if digits.startswith(("5", "6", "9")):
+            return "SH"
+        return "SZ"
+    if code.startswith(("SH", "SZ", "HK", "US")):
+        return code[:2]
+    if code.endswith(".HK"):
+        return "HK"
+    if code.endswith(".US"):
+        return "US"
+    return "OTHER"
+
+
+def _market_from_rule(stock_code: str, raw_rule: str) -> str:
+    if not raw_rule:
+        return _guess_market(stock_code)
+    code = (stock_code or "").strip().upper()
+    digits = "".join(ch for ch in code if ch.isdigit())
+    for token in [x.strip() for x in raw_rule.split(",") if x.strip()]:
+        if ":" not in token:
+            continue
+        key, market = token.split(":", 1)
+        key = key.strip().upper()
+        market = market.strip().upper()
+        if not key or not market:
+            continue
+        if code.startswith(key) or digits.startswith(key):
+            return market
+    return _guess_market(stock_code)
+
+
+def _prop_text_any(page: Dict[str, Any], key: str) -> str:
+    prop = get_prop(page, key)
+    typ = prop.get("type")
+    if typ == "title":
+        return rt_plain(prop.get("title", []))
+    if typ == "rich_text":
+        return rt_plain(prop.get("rich_text", []))
+    if typ == "select":
+        sel = prop.get("select")
+        return sel.get("name", "") if sel else ""
+    if typ == "status":
+        sel = prop.get("status")
+        return sel.get("name", "") if sel else ""
+    if typ == "date":
+        date_obj = prop.get("date")
+        if date_obj:
+            return date_obj.get("start", "")
+        return ""
+    if typ == "number":
+        num = prop.get("number")
+        return "" if num is None else str(num)
+    return ""
+
+
+class SnapshotStore:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        _ensure_parent_dir(db_path)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def _init_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_daily_snapshot (
+                snapshot_date TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                stock_id TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                market TEXT NOT NULL,
+                strategy_mode TEXT NOT NULL,
+                ret_1d REAL NOT NULL,
+                hit_flag INTEGER NOT NULL,
+                max_drawdown REAL NOT NULL,
+                confidence TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                buy_price REAL,
+                sell_price REAL,
+                stop_price REAL,
+                position_delta REAL NOT NULL,
+                run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, strategy_id, stock_id)
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_date_strategy ON strategy_daily_snapshot (snapshot_date, strategy_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_date_market ON strategy_daily_snapshot (snapshot_date, market)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_stock_strategy ON strategy_daily_snapshot (stock_id, strategy_id)"
+        )
+        self.conn.commit()
+
+    def upsert_many(self, rows: List[Dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        sql = """
+            INSERT INTO strategy_daily_snapshot (
+                snapshot_date, strategy_id, stock_id, stock_code, stock_name, market, strategy_mode,
+                ret_1d, hit_flag, max_drawdown, confidence, sample_count, action,
+                buy_price, sell_price, stop_price, position_delta, run_id, created_at, updated_at
+            ) VALUES (
+                :snapshot_date, :strategy_id, :stock_id, :stock_code, :stock_name, :market, :strategy_mode,
+                :ret_1d, :hit_flag, :max_drawdown, :confidence, :sample_count, :action,
+                :buy_price, :sell_price, :stop_price, :position_delta, :run_id, :created_at, :updated_at
+            )
+            ON CONFLICT(snapshot_date, strategy_id, stock_id) DO UPDATE SET
+                stock_code=excluded.stock_code,
+                stock_name=excluded.stock_name,
+                market=excluded.market,
+                strategy_mode=excluded.strategy_mode,
+                ret_1d=excluded.ret_1d,
+                hit_flag=excluded.hit_flag,
+                max_drawdown=excluded.max_drawdown,
+                confidence=excluded.confidence,
+                sample_count=excluded.sample_count,
+                action=excluded.action,
+                buy_price=excluded.buy_price,
+                sell_price=excluded.sell_price,
+                stop_price=excluded.stop_price,
+                position_delta=excluded.position_delta,
+                run_id=excluded.run_id,
+                updated_at=excluded.updated_at
+        """
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return len(rows)
+
+    def query_range(
+        self,
+        start_date: str,
+        end_date: str,
+        strategies: Optional[List[str]] = None,
+        markets: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT * FROM strategy_daily_snapshot
+            WHERE snapshot_date >= ? AND snapshot_date <= ?
+        """
+        args: List[Any] = [start_date, end_date]
+        if strategies:
+            marks = ",".join(["?"] * len(strategies))
+            sql += f" AND strategy_id IN ({marks})"
+            args.extend([x.upper() for x in strategies])
+        if markets:
+            marks = ",".join(["?"] * len(markets))
+            sql += f" AND market IN ({marks})"
+            args.extend([x.upper() for x in markets])
+        sql += " ORDER BY snapshot_date ASC, strategy_id ASC, stock_code ASC"
+        cur = self.conn.execute(sql, args)
+        return [dict(row) for row in cur.fetchall()]
 
 
 def audit(client: NotionClient, cfg: Cfg, as_json: bool) -> int:
@@ -168,40 +370,38 @@ def audit(client: NotionClient, cfg: Cfg, as_json: bool) -> int:
 
     annual_props = annual_db.get("properties", {})
     annual_manual_fields = []
-    for k in ["做T收益", "分红收益", "已实现收益"]:
+    for k in ["T收益", "分红收益", "已实现收益"]:
         if annual_props.get(k, {}).get("type") == "number":
             annual_manual_fields.append(k)
 
     checklist = [
         {
-            "缺口项": "交易流水（标准）承载逐笔交易",
-            "严重级别": "P0" if len(std_rows) == 0 else "P2",
-            "影响范围": f"交易流水当前 {len(std_rows)} 条",
-            "修复动作": "使用 add-trade 录入新交易，历史数据先 migrate-preview 再 migrate-apply",
-            "验收条件": "交易流水条数 > 0，且新增交易全部带日期/方向/股数/价格/股票关联",
+            "item": "标准交易流水覆盖",
+            "severity": "P0" if len(std_rows) == 0 else "P2",
+            "impact": f"标准交易记录 {len(std_rows)} 条",
+            "fix": "先 migrate-preview，再 migrate-apply；新增交易使用 add-trade",
+            "acceptance": "标准交易流水可持续增长，关键字段完整",
         },
         {
-            "缺口项": "股票主档代码完整性",
-            "严重级别": "P1" if missing_stock_code else "P3",
-            "影响范围": f"缺代码股票 {len(missing_stock_code)}/{len(stock_rows)}",
-            "修复动作": "补齐 股票代码 字段；新建股票时名称+代码同时填",
-            "验收条件": "股票主档缺代码数量 = 0",
+            "item": "股票代码完整性",
+            "severity": "P1" if missing_stock_code else "P3",
+            "impact": f"缺少股票代码 {len(missing_stock_code)}/{len(stock_rows)}",
+            "fix": "补齐股票代码字段",
+            "acceptance": "股票主档缺代码数量为 0",
         },
         {
-            "缺口项": "分红数据覆盖与关联",
-            "严重级别": "P1" if (div_missing_stock or div_missing_amount or div_missing_date) else "P3",
-            "影响范围": (
-                f"缺股票关联 {len(div_missing_stock)}; 缺金额 {len(div_missing_amount)}; 缺日期 {len(div_missing_date)}"
-            ),
-            "修复动作": "补齐分红记录的 股票/金额/日期，统一入 分红汇总（标准）",
-            "验收条件": "分红记录关键字段缺失数量 = 0",
+            "item": "分红记录完整性",
+            "severity": "P1" if (div_missing_stock or div_missing_amount or div_missing_date) else "P3",
+            "impact": f"缺股票关联 {len(div_missing_stock)}; 缺金额 {len(div_missing_amount)}; 缺日期 {len(div_missing_date)}",
+            "fix": "补齐分红记录关键字段",
+            "acceptance": "分红关键字段缺失数为 0",
         },
         {
-            "缺口项": "年度收益汇总自动化",
-            "严重级别": "P1" if annual_manual_fields else "P3",
-            "影响范围": f"手填依赖字段: {','.join(annual_manual_fields) or '无'}; 年度行数 {len(annual_rows)}",
-            "修复动作": "执行 sync-annual 按标准交易与分红重算年度表",
-            "验收条件": "sync-annual 后年度字段由脚本重算，不依赖手工录入",
+            "item": "年度收益自动化",
+            "severity": "P1" if annual_manual_fields else "P3",
+            "impact": f"手填字段: {','.join(annual_manual_fields) or '无'}; 年度记录 {len(annual_rows)}",
+            "fix": "执行 sync-annual 按标准交易与分红重算",
+            "acceptance": "年度收益由脚本重算，不依赖手工录入",
         },
     ]
 
@@ -209,25 +409,23 @@ def audit(client: NotionClient, cfg: Cfg, as_json: bool) -> int:
         print(json.dumps(checklist, ensure_ascii=False, indent=2))
         return 0
 
-    print("Stock结构缺口审计结果")
+    print("Stock audit checklist")
     print("=" * 80)
     for item in checklist:
-        print(f"- 缺口项: {item['缺口项']}")
-        print(f"  严重级别: {item['严重级别']}")
-        print(f"  影响范围: {item['影响范围']}")
-        print(f"  修复动作: {item['修复动作']}")
-        print(f"  验收条件: {item['验收条件']}")
+        print(f"- Item: {item['item']}")
+        print(f"  Severity: {item['severity']}")
+        print(f"  Impact: {item['impact']}")
+        print(f"  Fix: {item['fix']}")
+        print(f"  Acceptance: {item['acceptance']}")
     return 0
-
-
 def stock_index(client: NotionClient, cfg: Cfg) -> Tuple[Dict[str, str], Dict[str, str]]:
     rows = client.query_database_all(cfg.stock_master_id)
     by_name: Dict[str, str] = {}
     by_code: Dict[str, str] = {}
     for r in rows:
         pid = r.get("id")
-        name = p_title(r, "股票")
-        code = p_rich(r, "股票代码")
+        name = p_title(r, "鑲＄エ")
+        code = p_rich(r, "鑲＄エ浠ｇ爜")
         if name and pid and name not in by_name:
             by_name[name] = pid
         if code and pid and code not in by_code:
@@ -253,7 +451,7 @@ def extract_candidates(client: NotionClient, cfg: Cfg) -> List[Dict[str, Any]]:
             stock_id = by_name.get(col, "")
             candidates.append(
                 {
-                    "记录": f"{src_title or '历史记录'} | {col}",
+                    "璁板綍": f"{src_title or '鍘嗗彶璁板綍'} | {col}",
                     "source_table": "old_buy_record",
                     "source_row_id": row_id,
                     "source_title": src_title,
@@ -266,15 +464,15 @@ def extract_candidates(client: NotionClient, cfg: Cfg) -> List[Dict[str, Any]]:
 
     for row in client.query_database_all(cfg.t_record_id):
         row_id = row.get("id", "")
-        title = p_title(row, "交易")
-        date_s = p_date(row, "日期")
-        shares = p_number(row, "股数")
+        title = p_title(row, "浜ゆ槗")
+        date_s = p_date(row, "鏃ユ湡")
+        shares = p_number(row, "鑲℃暟")
         buy_price = p_number(row, "买入价")
         sell_price = p_number(row, "卖出价")
         fee = p_number(row, "手续费")
         tax = p_number(row, "印花税")
-        note = p_rich(row, "备注")
-        rel = p_relation_ids(row, "股票")
+        note = p_rich(row, "澶囨敞")
+        rel = p_relation_ids(row, "鑲＄エ")
 
         is_empty = not any(
             [
@@ -298,11 +496,11 @@ def extract_candidates(client: NotionClient, cfg: Cfg) -> List[Dict[str, Any]]:
 
         candidates.append(
             {
-                "记录": f"{title or '做T历史记录'} | {date_s or 'no-date'}",
+                "璁板綍": f"{title or '鍋歍鍘嗗彶璁板綍'} | {date_s or 'no-date'}",
                 "source_table": "old_t_record",
                 "source_row_id": row_id,
                 "source_title": title,
-                "source_stock_col": "做T交易记录",
+                "source_stock_col": "鍋歍浜ゆ槗璁板綍",
                 "source_value": source_value,
                 "import_status": "pending_shares",
                 "stock_id": rel[0] if rel else "",
@@ -327,12 +525,12 @@ def migrate_preview(client: NotionClient, cfg: Cfg, sample: int) -> int:
     existed = existing_source_keys(client, cfg)
     todo = [x for x in candidates if f"{x['source_table']}|{x['source_row_id']}|{x['source_stock_col']}" not in existed]
 
-    print(f"候选记录: {len(candidates)}")
-    print(f"已存在去重键: {len(existed)}")
-    print(f"待导入: {len(todo)}")
+    print(f"鍊欓€夎褰? {len(candidates)}")
+    print(f"宸插瓨鍦ㄥ幓閲嶉敭: {len(existed)}")
+    print(f"寰呭鍏? {len(todo)}")
     for i, item in enumerate(todo[:sample], start=1):
         print(
-            f"{i}. {item['记录']} | source={item['source_table']} | col={item['source_stock_col']} | value={item['source_value']}"
+            f"{i}. {item['璁板綍']} | source={item['source_table']} | col={item['source_stock_col']} | value={item['source_value']}"
         )
     return 0
 
@@ -347,7 +545,7 @@ def migrate_apply(client: NotionClient, cfg: Cfg, limit: int) -> int:
     inserted = 0
     for item in todo:
         props: Dict[str, Any] = {
-            "记录": title_prop(item["记录"]),
+            "璁板綍": title_prop(item["璁板綍"]),
             "source_table": {"select": {"name": item["source_table"]}},
             "source_row_id": text_prop(item["source_row_id"]),
             "source_title": text_prop(item["source_title"]),
@@ -356,7 +554,7 @@ def migrate_apply(client: NotionClient, cfg: Cfg, limit: int) -> int:
             "import_status": {"select": {"name": item["import_status"]}},
         }
         if item.get("stock_id"):
-            props["股票"] = {"relation": [{"id": item["stock_id"]}]}
+            props["鑲＄エ"] = {"relation": [{"id": item["stock_id"]}]}
 
         client.create_page(cfg.std_trades_id, props)
         inserted += 1
@@ -380,34 +578,34 @@ def add_trade(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
     by_name, by_code = stock_index(client, cfg)
     stock_id = by_code.get(args.stock) or by_name.get(args.stock)
     if not stock_id:
-        raise ValueError(f"stock '{args.stock}' not found in 股票主档 title or 股票代码")
+        raise ValueError(f"stock '{args.stock}' not found in 鑲＄エ涓绘。 title or 鑲＄エ浠ｇ爜")
 
     title = f"{args.date} {args.direction} {args.stock} {args.shares}@{args.price}"
     props: Dict[str, Any] = {
-        "记录": title_prop(title),
-        "日期": {"date": {"start": args.date}},
-        "方向": {"select": {"name": args.direction}},
-        "股数": {"number": float(args.shares)},
-        "价格": {"number": float(args.price)},
+        "璁板綍": title_prop(title),
+        "鏃ユ湡": {"date": {"start": args.date}},
+        "鏂瑰悜": {"select": {"name": args.direction}},
+        "鑲℃暟": {"number": float(args.shares)},
+        "浠锋牸": {"number": float(args.price)},
         "手续费": {"number": float(args.fee)},
-        "税费": {"number": float(args.tax)},
-        "股票": {"relation": [{"id": stock_id}]},
+        "绋庤垂": {"number": float(args.tax)},
+        "鑲＄エ": {"relation": [{"id": stock_id}]},
         "source_table": {"select": {"name": "manual"}},
         "import_status": {"select": {"name": "ready"}},
     }
     if args.strategy:
-        props["策略"] = {"select": {"name": args.strategy}}
+        props["绛栫暐"] = {"select": {"name": args.strategy}}
     if args.note:
-        props["备注"] = {"rich_text": [{"type": "text", "text": {"content": args.note[:2000]}}]}
+        props["澶囨敞"] = {"rich_text": [{"type": "text", "text": {"content": args.note[:2000]}}]}
 
     page = client.create_page(cfg.std_trades_id, props)
-    print(f"新增交易成功: id={page.get('id')}")
+    print(f"鏂板浜ゆ槗鎴愬姛: id={page.get('id')}")
     return 0
 
 
 def validate_manual_entries(client: NotionClient, cfg: Cfg) -> int:
     rows = client.query_database_all(cfg.std_trades_id)
-    required = ["日期", "方向", "股数", "价格", "股票", "记录"]
+    required = ["鏃ユ湡", "鏂瑰悜", "鑲℃暟", "浠锋牸", "鑲＄エ", "璁板綍"]
     failures: List[Tuple[str, List[str]]] = []
     checked = 0
 
@@ -417,25 +615,25 @@ def validate_manual_entries(client: NotionClient, cfg: Cfg) -> int:
             continue
         checked += 1
         missing: List[str] = []
-        if not p_date(r, "日期"):
-            missing.append("日期")
-        if p_select(r, "方向") not in {"BUY", "SELL"}:
-            missing.append("方向")
-        if p_number(r, "股数") is None:
-            missing.append("股数")
-        if p_number(r, "价格") is None:
-            missing.append("价格")
-        if len(p_relation_ids(r, "股票")) == 0:
-            missing.append("股票")
-        if not p_title(r, "记录"):
-            missing.append("记录")
+        if not p_date(r, "鏃ユ湡"):
+            missing.append("鏃ユ湡")
+        if p_select(r, "鏂瑰悜") not in {"BUY", "SELL"}:
+            missing.append("鏂瑰悜")
+        if p_number(r, "鑲℃暟") is None:
+            missing.append("鑲℃暟")
+        if p_number(r, "浠锋牸") is None:
+            missing.append("浠锋牸")
+        if len(p_relation_ids(r, "鑲＄エ")) == 0:
+            missing.append("鑲＄エ")
+        if not p_title(r, "璁板綍"):
+            missing.append("璁板綍")
         if missing:
             failures.append((r.get("id", ""), missing))
 
-    print(f"检查记录数(manual/未标注): {checked}")
-    print(f"不合规记录数: {len(failures)}")
+    print(f"妫€鏌ヨ褰曟暟(manual/鏈爣娉?: {checked}")
+    print(f"涓嶅悎瑙勮褰曟暟: {len(failures)}")
     for rid, missing in failures[:20]:
-        print(f"- {rid}: 缺失 {','.join(missing)}")
+        print(f"- {rid}: 缂哄け {','.join(missing)}")
     return 0 if not failures else 2
 
 
@@ -454,7 +652,7 @@ def annual_sync(client: NotionClient, cfg: Cfg, dry_run: bool) -> int:
 
     def init_year(y: str) -> None:
         if y not in totals:
-            totals[y] = {"已实现收益": 0.0, "做T收益": 0.0, "分红收益": 0.0}
+            totals[y] = {"已实现收益": 0.0, "T收益": 0.0, "分红收益": 0.0}
 
     for row in tx_rows:
         y = parse_year(p_date(row, "日期"))
@@ -462,11 +660,11 @@ def annual_sync(client: NotionClient, cfg: Cfg, dry_run: bool) -> int:
             continue
         init_year(y)
         realized = p_formula_number(row, "单笔已实现收益")
-        t_profit = p_formula_number(row, "单笔做T收益")
+        t_profit = p_formula_number(row, "单笔T收益")
         if realized is not None:
             totals[y]["已实现收益"] += float(realized)
         if t_profit is not None:
-            totals[y]["做T收益"] += float(t_profit)
+            totals[y]["T收益"] += float(t_profit)
 
     for row in div_rows:
         y = parse_year(p_date(row, "日期"))
@@ -477,28 +675,24 @@ def annual_sync(client: NotionClient, cfg: Cfg, dry_run: bool) -> int:
         if amount is not None:
             totals[y]["分红收益"] += float(amount)
 
-    annual_title = "年份"
     annual_index: Dict[str, str] = {}
     for row in annual_rows:
-        year = p_title(row, annual_title)
+        year = p_title(row, "年份")
         if year:
             annual_index[year] = row.get("id", "")
 
     years = sorted(totals.keys())
     print(f"将同步年份: {', '.join(years) if years else '(none)'}")
-    for y in years:
-        vals = totals[y]
-        print(f"- {y}: 已实现={vals['已实现收益']:.2f}, 做T={vals['做T收益']:.2f}, 分红={vals['分红收益']:.2f}")
 
     if dry_run:
-        print("dry-run: 未写入年度收益汇总（标准）")
+        print("dry-run: 未写入年度收益汇总")
         return 0
 
     for y in years:
         vals = totals[y]
         props = {
             "已实现收益": {"number": round(vals["已实现收益"], 6)},
-            "做T收益": {"number": round(vals["做T收益"], 6)},
+            "T收益": {"number": round(vals["T收益"], 6)},
             "分红收益": {"number": round(vals["分红收益"], 6)},
         }
         if y in annual_index and annual_index[y]:
@@ -507,14 +701,13 @@ def annual_sync(client: NotionClient, cfg: Cfg, dry_run: bool) -> int:
             create_props = {
                 "年份": title_prop(y),
                 "已实现收益": {"number": round(vals["已实现收益"], 6)},
-                "做T收益": {"number": round(vals["做T收益"], 6)},
+                "T收益": {"number": round(vals["T收益"], 6)},
                 "分红收益": {"number": round(vals["分红收益"], 6)},
             }
             client.create_page(cfg.annual_id, create_props)
+
     print(f"年度汇总同步完成: {len(years)} 年")
     return 0
-
-
 @dataclass
 class TradePoint:
     date: str
@@ -544,16 +737,16 @@ def _resolve_stock_fields(stock_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
     props = stock_db.get("properties", {})
     return {
         "title": find_title_property_name(stock_db),
-        "stock_code": _find_prop_name(props, ["股票代码", "鑲＄エ浠ｇ爜"], ["rich_text"]),
-        "current_price": _find_prop_name(props, ["当前市价", "最新价", "现价"], ["number"]),
+        "stock_code": _find_prop_name(props, ["股票代码", "代码"], ["rich_text", "title"]),
+        "current_price": _find_prop_name(props, ["当前市价", "最新价", "现价", "市价"], ["number"]),
         "current_cost": _find_prop_name(props, ["当前持仓成本", "持仓成本", "成本价"], ["number"]),
-        "out_action": _find_prop_name(props, ["建议动作"], ["select", "status", "rich_text"]),
+        "out_action": _find_prop_name(props, ["建议动作"], ["select", "status", "rich_text", "title"]),
         "out_buy": _find_prop_name(props, ["建议买入价"], ["number"]),
         "out_sell": _find_prop_name(props, ["建议卖出价"], ["number"]),
         "out_stop": _find_prop_name(props, ["建议止损价"], ["number"]),
         "out_pos": _find_prop_name(props, ["建议仓位变化"], ["number"]),
-        "out_conf": _find_prop_name(props, ["建议置信度"], ["select", "status", "rich_text"]),
-        "out_mode": _find_prop_name(props, ["建议模式"], ["select", "status", "rich_text"]),
+        "out_conf": _find_prop_name(props, ["建议置信度"], ["select", "status", "rich_text", "title"]),
+        "out_mode": _find_prop_name(props, ["建议模式"], ["select", "status", "rich_text", "title"]),
         "out_reason": _find_prop_name(props, ["建议原因", "触发原因"], ["rich_text", "title"]),
         "out_time": _find_prop_name(props, ["建议更新时间"], ["date", "rich_text"]),
     }
@@ -562,11 +755,11 @@ def _resolve_stock_fields(stock_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
 def _resolve_trade_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
     props = trade_db.get("properties", {})
     return {
-        "date": _find_prop_name(props, ["日期"], ["date"]),
-        "direction": _find_prop_name(props, ["方向"], ["select", "status"]),
-        "shares": _find_prop_name(props, ["股数"], ["number"]),
-        "price": _find_prop_name(props, ["价格"], ["number"]),
-        "stock": _find_prop_name(props, ["股票"], ["relation"]),
+        "date": _find_prop_name(props, ["鏃ユ湡"], ["date"]),
+        "direction": _find_prop_name(props, ["鏂瑰悜"], ["select", "status"]),
+        "shares": _find_prop_name(props, ["鑲℃暟"], ["number"]),
+        "price": _find_prop_name(props, ["浠锋牸"], ["number"]),
+        "stock": _find_prop_name(props, ["鑲＄エ"], ["relation"]),
         "realized": _find_prop_name(props, ["单笔已实现收益"], ["formula", "number"]),
     }
 
@@ -596,7 +789,7 @@ def _resolve_stock_fields_runtime(stock_db: Dict[str, Any]) -> Dict[str, Optiona
     if not fields.get("current_cost"):
         fields["current_cost"] = _find_prop_by_keywords(props, ["持仓成本", "成本"], ["number"])
     if not fields.get("out_action"):
-        fields["out_action"] = _find_prop_by_keywords(props, ["建议动作"], ["select", "status", "rich_text"])
+        fields["out_action"] = _find_prop_by_keywords(props, ["建议动作"], ["select", "status", "rich_text", "title"])
     if not fields.get("out_buy"):
         fields["out_buy"] = _find_prop_by_keywords(props, ["建议买入价"], ["number"])
     if not fields.get("out_sell"):
@@ -606,9 +799,9 @@ def _resolve_stock_fields_runtime(stock_db: Dict[str, Any]) -> Dict[str, Optiona
     if not fields.get("out_pos"):
         fields["out_pos"] = _find_prop_by_keywords(props, ["建议仓位变化"], ["number"])
     if not fields.get("out_conf"):
-        fields["out_conf"] = _find_prop_by_keywords(props, ["建议置信度"], ["select", "status", "rich_text"])
+        fields["out_conf"] = _find_prop_by_keywords(props, ["建议置信度"], ["select", "status", "rich_text", "title"])
     if not fields.get("out_mode"):
-        fields["out_mode"] = _find_prop_by_keywords(props, ["建议模式"], ["select", "status", "rich_text"])
+        fields["out_mode"] = _find_prop_by_keywords(props, ["建议模式"], ["select", "status", "rich_text", "title"])
     if not fields.get("out_reason"):
         fields["out_reason"] = _find_prop_by_keywords(props, ["建议原因", "触发原因"], ["rich_text", "title"])
     if not fields.get("out_time"):
@@ -681,9 +874,9 @@ def sync_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int
     stock_db = client.get_database(cfg.stock_master_id)
     fields = _resolve_stock_fields_runtime(stock_db)
     if not fields.get("stock_code"):
-        raise RuntimeError("无法定位股票代码字段（需要 rich_text/title 类型）")
+        raise RuntimeError("Unable to locate stock code field (rich_text/title required).")
     if not fields.get("current_price"):
-        raise RuntimeError("无法定位当前市价字段（需要 number 类型）")
+        raise RuntimeError("Unable to locate current price field (number required).")
 
     stock_rows = client.query_database_all(cfg.stock_master_id)
     db_props = stock_db.get("properties", {})
@@ -840,7 +1033,7 @@ def _recommend_from_points(
             "position_delta": 0.0,
             "confidence": "LOW",
             "mode": "TREND_FALLBACK",
-            "reason": "行情或价格缺失，无法生成有效建议",
+            "reason": "missing current price",
             "sample_count": len(points),
         }
 
@@ -856,7 +1049,7 @@ def _recommend_from_points(
             "position_delta": 0.0,
             "confidence": "LOW",
             "mode": "TREND_FALLBACK",
-            "reason": "样本不足，且未开启小样本建议",
+            "reason": "sample too small",
             "sample_count": sample_count,
         }
 
@@ -884,7 +1077,7 @@ def _recommend_from_points(
             "position_delta": 0.0,
             "confidence": conf_level,
             "mode": mode,
-            "reason": "波动异常放大，触发不交易条件",
+            "reason": "volatility too high",
             "sample_count": sample_count,
         }
 
@@ -902,28 +1095,27 @@ def _recommend_from_points(
         sell_price = max(sell_price, current_cost * 1.005)
 
     action = "HOLD"
-    reason = "信号中性，维持观望"
+    reason = "neutral"
     if trend > 0.015:
         action = "BUY"
-        reason = "趋势向上，建议逢回落分批买入"
+        reason = "up trend"
     elif trend < -0.015:
         action = "SELL"
-        reason = "趋势转弱，建议逢反弹减仓"
+        reason = "down trend"
 
     expected_up = max(0.0, (sell_price - current_price) / current_price)
     expected_down = max(0.0, (current_price - stop_price) / current_price)
     if expected_up <= expected_down * 0.8:
         action = "HOLD"
-        reason = "预期风险收益比劣于维持仓位，触发不交易条件"
+        reason = "risk/reward not favorable"
 
     if _level_rank(conf_level) < _level_rank(min_confidence):
         action = "HOLD"
-        reason = f"建议置信度 {conf_level} 低于阈值 {min_confidence}"
+        reason = f"confidence {conf_level} < {min_confidence}"
 
     pos_base = {"HIGH": 0.15, "MEDIUM": 0.10, "LOW": 0.05}[conf_level]
     if mode == "TREND_FALLBACK":
         pos_base *= 0.5
-        reason = f"{reason}; 样本不足，趋势回退模型"
 
     pos_delta = 0.0
     if action == "BUY":
@@ -934,7 +1126,7 @@ def _recommend_from_points(
     if mode == "TREND_FALLBACK" and conf_level == "LOW" and action == "BUY":
         action = "HOLD"
         pos_delta = 0.0
-        reason = "低置信度下不新开仓，维持观望"
+        reason = "fallback+low confidence"
 
     return {
         "action": action,
@@ -947,8 +1139,6 @@ def _recommend_from_points(
         "reason": reason,
         "sample_count": sample_count,
     }
-
-
 def _parse_strategy_set(raw: str) -> List[str]:
     allowed = {"baseline", "chan", "atr_wave"}
     items = [x.strip().lower() for x in (raw or "").split(",") if x.strip()]
@@ -1145,7 +1335,11 @@ def _recommend_by_strategy(
     return rec
 
 
-def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+def _prepare_recommendation_context(
+    client: NotionClient,
+    cfg: Cfg,
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], Dict[str, Optional[str]], List[Dict[str, Any]], Dict[str, List[TradePoint]]]:
     stock_db = client.get_database(cfg.stock_master_id)
     trade_db = client.get_database(cfg.std_trades_id)
     stock_fields = _resolve_stock_fields_runtime(stock_db)
@@ -1165,18 +1359,23 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
         stock_rows = client.query_database_all(cfg.stock_master_id)
     trade_rows = client.query_database_all(cfg.std_trades_id)
     stock_points = _build_trade_points(trade_rows, trade_fields)
+    return stock_db, stock_fields, stock_rows, stock_points
 
-    db_props = stock_db.get("properties", {})
-    asof_date = args.asof_date or dt.date.today().isoformat()
 
+def _collect_recommendations(
+    stock_rows: List[Dict[str, Any]],
+    stock_fields: Dict[str, Optional[str]],
+    stock_points: Dict[str, List[TradePoint]],
+    args: argparse.Namespace,
+) -> List[Dict[str, Any]]:
     selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
     recs: List[Dict[str, Any]] = []
     for row in stock_rows:
         stock_id = row.get("id", "")
         title = p_title(row, stock_fields["title"]) if stock_fields["title"] else stock_id
+        code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
         current_price = p_number(row, stock_fields["current_price"]) if stock_fields["current_price"] else None
         current_cost = p_number(row, stock_fields["current_cost"]) if stock_fields["current_cost"] else None
-        stock_recs: List[Dict[str, Any]] = []
         for sid in selected_strategies:
             rec = _recommend_by_strategy(
                 strategy_id=sid,
@@ -1188,12 +1387,127 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
             )
             rec["stock_id"] = stock_id
             rec["stock_name"] = title
-            stock_recs.append(rec)
+            rec["stock_code"] = code_raw
             recs.append(rec)
+    return recs
 
+
+def _price_returns(points: List[TradePoint]) -> List[float]:
+    valid_prices = [p.price for p in points if p.price is not None and p.price > 0]
+    out: List[float] = []
+    for i in range(1, len(valid_prices)):
+        prev = valid_prices[i - 1]
+        curr = valid_prices[i]
+        if prev > 0:
+            out.append((curr - prev) / prev)
+    return out
+
+
+def _ret_1d(points: List[TradePoint]) -> float:
+    valid_prices = [p.price for p in points if p.price is not None and p.price > 0]
+    if len(valid_prices) < 2:
+        return 0.0
+    prev = valid_prices[-2]
+    curr = valid_prices[-1]
+    if prev <= 0:
+        return 0.0
+    return float((curr - prev) / prev)
+
+
+def _hit_flag(action: str, ret_1d: float) -> int:
+    if action == "BUY":
+        return 1 if ret_1d > 0 else 0
+    if action == "SELL":
+        return 1 if ret_1d < 0 else 0
+    return 1 if abs(ret_1d) <= 0.002 else 0
+
+
+def _build_snapshot_rows(
+    recs: List[Dict[str, Any]],
+    stock_points: Dict[str, List[TradePoint]],
+    snapshot_date: str,
+    market_rule: str,
+    run_id: str,
+) -> List[Dict[str, Any]]:
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    rows: List[Dict[str, Any]] = []
+    for rec in recs:
+        stock_id = rec.get("stock_id", "")
+        points = stock_points.get(stock_id, [])
+        returns = _price_returns(points)
+        ret_1d = _ret_1d(points)
+        stock_code = _coerce_text(rec.get("stock_code", ""))
+        row = {
+            "snapshot_date": snapshot_date,
+            "strategy_id": _coerce_text(rec.get("strategy_id", "")).upper(),
+            "stock_id": stock_id,
+            "stock_code": stock_code,
+            "stock_name": _coerce_text(rec.get("stock_name", "")),
+            "market": _market_from_rule(stock_code, market_rule),
+            "strategy_mode": _coerce_text(rec.get("mode", "")),
+            "ret_1d": float(ret_1d),
+            "hit_flag": int(_hit_flag(_coerce_text(rec.get("action", "")), ret_1d)),
+            "max_drawdown": float(_max_drawdown(returns)),
+            "confidence": _coerce_text(rec.get("confidence", "")),
+            "sample_count": int(rec.get("sample_count", 0) or 0),
+            "action": _coerce_text(rec.get("action", "")),
+            "buy_price": float(rec["buy_price"]) if rec.get("buy_price") is not None else None,
+            "sell_price": float(rec["sell_price"]) if rec.get("sell_price") is not None else None,
+            "stop_price": float(rec["stop_price"]) if rec.get("stop_price") is not None else None,
+            "position_delta": float(rec.get("position_delta", 0.0) or 0.0),
+            "run_id": run_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if row["snapshot_date"] and row["strategy_id"] and row["stock_id"]:
+            rows.append(row)
+    return rows
+
+
+def _emit_snapshot(recs: List[Dict[str, Any]], stock_points: Dict[str, List[TradePoint]], snapshot_date: str, dry_run: bool) -> Dict[str, Any]:
+    run_id = uuid4().hex[:12]
+    rows = _build_snapshot_rows(
+        recs=recs,
+        stock_points=stock_points,
+        snapshot_date=snapshot_date,
+        market_rule=os.getenv("SNAPSHOT_MARKET_RULE", ""),
+        run_id=run_id,
+    )
+    sqlite_path = _sqlite_path()
+    written = 0
+    if not dry_run:
+        store = SnapshotStore(sqlite_path)
+        try:
+            written = store.upsert_many(rows)
+        finally:
+            store.close()
+    return {
+        "snapshot_date": snapshot_date,
+        "sqlite_path": sqlite_path,
+        "run_id": run_id,
+        "input_rows": len(rows),
+        "upserted": written,
+        "dry_run": bool(dry_run),
+    }
+
+
+def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+    stock_db, stock_fields, stock_rows, stock_points = _prepare_recommendation_context(client, cfg, args)
+
+    db_props = stock_db.get("properties", {})
+    asof_date = args.asof_date or dt.date.today().isoformat()
+
+    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, args)
+    rec_by_stock: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for rec in recs:
+        rec_by_stock[rec.get("stock_id", "")].append(rec)
+
+    for row in stock_rows:
+        stock_id = row.get("id", "")
         if args.dry_run:
             continue
 
+        stock_recs = rec_by_stock.get(stock_id, [])
         rec_for_write = None
         for r in stock_recs:
             if r.get("strategy_id") == "BASELINE":
@@ -1224,6 +1538,14 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
                 props[prop_name] = payload
         if props:
             client.update_page(stock_id, props)
+
+    if getattr(args, "emit_snapshot", False):
+        _emit_snapshot(
+            recs=recs,
+            stock_points=stock_points,
+            snapshot_date=_today_or(getattr(args, "snapshot_date", "")),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
 
     print(json.dumps(recs, ensure_ascii=False, indent=2))
     return 0
@@ -1341,6 +1663,193 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
     return 0
 
 
+def snapshot_daily(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+    stock_db, stock_fields, stock_rows, stock_points = _prepare_recommendation_context(client, cfg, args)
+    _ = stock_db
+    _ = stock_fields
+    _ = stock_rows
+    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, args)
+    result = _emit_snapshot(
+        recs=recs,
+        stock_points=stock_points,
+        snapshot_date=_today_or(getattr(args, "snapshot_date", "")),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _split_csv(raw: str) -> List[str]:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
+def _history_payload(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_strategy: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_market: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_day[row["snapshot_date"]].append(row)
+        by_strategy[row["strategy_id"]].append(row)
+        by_market[row["market"]].append(row)
+
+    def _agg(items: List[Dict[str, Any]]) -> Dict[str, float]:
+        returns = [float(x.get("ret_1d", 0.0) or 0.0) for x in items]
+        hit_vals = [float(x.get("hit_flag", 0) or 0) for x in items]
+        return {
+            "count": float(len(items)),
+            "return_mean": _safe_mean(returns) if returns else 0.0,
+            "return_sum": float(sum(returns)),
+            "hit_rate": _safe_mean(hit_vals) if hit_vals else 0.0,
+            "max_drawdown_mean": _safe_mean([float(x.get("max_drawdown", 0.0) or 0.0) for x in items]) if items else 0.0,
+        }
+
+    by_day_rows: List[Dict[str, Any]] = []
+    for day, items in sorted(by_day.items()):
+        row = {"snapshot_date": day}
+        row.update(_agg(items))
+        by_day_rows.append(row)
+    day_returns = [float(x["return_mean"]) for x in by_day_rows]
+    summary = _agg(rows)
+    summary["max_drawdown_curve"] = _max_drawdown(day_returns) if day_returns else 0.0
+
+    by_strategy_rows: List[Dict[str, Any]] = []
+    for sid, items in sorted(by_strategy.items()):
+        row = {"strategy_id": sid}
+        row.update(_agg(items))
+        by_strategy_rows.append(row)
+
+    by_market_rows: List[Dict[str, Any]] = []
+    for market, items in sorted(by_market.items()):
+        row = {"market": market}
+        row.update(_agg(items))
+        by_market_rows.append(row)
+
+    return {
+        "summary": summary,
+        "by_day": by_day_rows,
+        "by_strategy": by_strategy_rows,
+        "by_market": by_market_rows,
+        "rows": rows,
+    }
+
+
+def history_query(args: argparse.Namespace) -> int:
+    start_date = _today_or(getattr(args, "start_date", ""))
+    end_date = _today_or(getattr(args, "end_date", "")) if getattr(args, "end_date", "") else start_date
+    strategies = [x.upper() for x in _split_csv(getattr(args, "strategies", ""))]
+    markets = [x.upper() for x in _split_csv(getattr(args, "markets", ""))]
+    store = SnapshotStore(_sqlite_path())
+    try:
+        rows = store.query_range(start_date, end_date, strategies=strategies or None, markets=markets or None)
+    finally:
+        store.close()
+    print(json.dumps(_history_payload(rows), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _resolve_snapshot_notion_fields(snapshot_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    props = snapshot_db.get("properties", {})
+    return {
+        "title": find_title_property_name(snapshot_db),
+        "date": _find_prop_name(props, ["日期", "快照日期", "snapshot_date"], ["date", "rich_text"]),
+        "strategy": _find_prop_name(props, ["策略", "strategy_id"], ["select", "status", "rich_text", "title"]),
+        "stock_code": _find_prop_name(props, ["股票代码", "代码", "stock_code"], ["rich_text", "title"]),
+        "stock_name": _find_prop_name(props, ["股票", "股票名称", "stock_name"], ["rich_text", "title"]),
+        "market": _find_prop_name(props, ["市场", "market"], ["select", "status", "rich_text", "title"]),
+        "ret_1d": _find_prop_name(props, ["收益", "ret_1d", "1D收益"], ["number"]),
+        "max_drawdown": _find_prop_name(props, ["回撤", "max_drawdown"], ["number"]),
+        "hit_rate": _find_prop_name(props, ["命中率", "hit_rate", "hit_flag"], ["number"]),
+        "sample_count": _find_prop_name(props, ["样本数", "sample_count"], ["number"]),
+        "action": _find_prop_name(props, ["动作", "action"], ["select", "status", "rich_text", "title"]),
+        "confidence": _find_prop_name(props, ["置信度", "confidence"], ["select", "status", "rich_text", "title"]),
+    }
+
+
+def _snapshot_notion_key_from_page(page: Dict[str, Any], fields: Dict[str, Optional[str]]) -> str:
+    date_v = _prop_text_any(page, fields["date"]) if fields.get("date") else ""
+    strategy_v = _prop_text_any(page, fields["strategy"]) if fields.get("strategy") else ""
+    code_v = _prop_text_any(page, fields["stock_code"]) if fields.get("stock_code") else ""
+    return f"{date_v}|{strategy_v.upper()}|{code_v.upper()}"
+
+
+def sync_snapshot_notion(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+    if not cfg.strategy_snapshot_id:
+        raise RuntimeError("Missing DB_STRATEGY_SNAPSHOT_ID for snapshot notion sync.")
+    snapshot_date = _today_or(getattr(args, "snapshot_date", ""))
+    store = SnapshotStore(_sqlite_path())
+    try:
+        rows = store.query_range(snapshot_date, snapshot_date)
+    finally:
+        store.close()
+
+    snapshot_db = client.get_database(cfg.strategy_snapshot_id)
+    db_props = snapshot_db.get("properties", {})
+    fields = _resolve_snapshot_notion_fields(snapshot_db)
+    if not fields.get("date") or not fields.get("strategy") or not fields.get("stock_code"):
+        raise RuntimeError("Notion snapshot DB must contain 鏃ユ湡/绛栫暐/鑲＄エ浠ｇ爜 fields.")
+
+    existing_rows = client.query_database_all(cfg.strategy_snapshot_id)
+    existing_index: Dict[str, str] = {}
+    for row in existing_rows:
+        key = _snapshot_notion_key_from_page(row, fields)
+        if key and key not in existing_index:
+            existing_index[key] = row.get("id", "")
+
+    created = 0
+    updated = 0
+    for row in rows:
+        key = f"{row['snapshot_date']}|{row['strategy_id'].upper()}|{row['stock_code'].upper()}"
+        payload: Dict[str, Any] = {}
+        write_map = [
+            (fields["date"], row["snapshot_date"]),
+            (fields["strategy"], row["strategy_id"]),
+            (fields["stock_code"], row["stock_code"]),
+            (fields["stock_name"], row["stock_name"]),
+            (fields["market"], row["market"]),
+            (fields["ret_1d"], row["ret_1d"]),
+            (fields["max_drawdown"], row["max_drawdown"]),
+            (fields["hit_rate"], row["hit_flag"]),
+            (fields["sample_count"], row["sample_count"]),
+            (fields["action"], row["action"]),
+            (fields["confidence"], row["confidence"]),
+        ]
+        for prop_name, value in write_map:
+            if not prop_name:
+                continue
+            mapped = _write_prop_value(db_props, prop_name, value)
+            if mapped is not None:
+                payload[prop_name] = mapped
+        title_name = fields.get("title")
+        if title_name and title_name not in payload:
+            title_text = f"{row['snapshot_date']} {row['strategy_id']} {row['stock_code']}"
+            mapped = _write_prop_value(db_props, title_name, title_text)
+            if mapped is not None:
+                payload[title_name] = mapped
+
+        existing_id = existing_index.get(key, "")
+        if existing_id:
+            if not getattr(args, "dry_run", False):
+                client.update_page(existing_id, payload)
+            updated += 1
+        else:
+            if not getattr(args, "dry_run", False):
+                created_page = client.create_page(cfg.strategy_snapshot_id, payload)
+                new_id = created_page.get("id", "")
+                if new_id:
+                    existing_index[key] = new_id
+            created += 1
+
+    out = {
+        "snapshot_date": snapshot_date,
+        "local_rows": len(rows),
+        "updated": updated,
+        "created": created,
+        "dry_run": bool(getattr(args, "dry_run", False)),
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Stock page pipeline for audit, migration and automation.")
     p.add_argument("--token", default=os.getenv("NOTION_TOKEN"))
@@ -1354,7 +1863,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_mp = sub.add_parser("migrate-preview", help="预览历史数据迁移结果")
     s_mp.add_argument("--sample", type=int, default=20)
 
-    s_ma = sub.add_parser("migrate-apply", help="执行历史数据迁移到交易流水（标准）")
+    s_ma = sub.add_parser("migrate-apply", help="执行历史数据迁移到交易流水")
     s_ma.add_argument("--limit", type=int, default=0, help="0=全部，其它=仅导入前N条")
 
     s_add = sub.add_parser("add-trade", help="新增一笔标准交易")
@@ -1368,9 +1877,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_add.add_argument("--strategy", default="")
     s_add.add_argument("--note", default="")
 
-    sub.add_parser("validate-manual", help="校验手工录入是否满足必填约束")
+    sub.add_parser("validate-manual", help="校验手工记录必填字段")
 
-    s_ys = sub.add_parser("sync-annual", help="按交易+分红重算年度收益汇总")
+    s_ys = sub.add_parser("sync-annual", help="按交易+分红重算年度收益")
     s_ys.add_argument("--dry-run", action="store_true")
 
     s_rec = sub.add_parser("recommend-prices", help="计算并回写每只股票的下一次交易建议价位")
@@ -1380,10 +1889,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_rec.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_rec.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
     s_rec.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
-    s_rec.add_argument("--refresh-prices", action="store_true", help="先自动拉取实时当前市价，再计算建议")
+    s_rec.add_argument("--refresh-prices", action="store_true", help="先同步实时价格再计算建议")
     s_rec.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
+    s_rec.add_argument("--emit-snapshot", action="store_true", help="recommend后写入每日快照")
+    s_rec.add_argument("--snapshot-date", default="", help="快照日期，默认今天 YYYY-MM-DD")
 
-    s_bt = sub.add_parser("backtest-recommendation", help="回测建议模型，输出FULL_MODEL与TREND_FALLBACK绩效")
+    s_bt = sub.add_parser("backtest-recommendation", help="回测建议模型")
     s_bt.add_argument("--window", type=int, default=60, help="历史窗口长度（按交易事件）")
     s_bt.add_argument("--allow-small-sample", action="store_true", default=True)
     s_bt.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
@@ -1394,9 +1905,27 @@ def build_parser() -> argparse.ArgumentParser:
     s_sp.add_argument("--dry-run", action="store_true", help="仅拉取并输出统计，不写入Notion")
     s_sp.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
 
+    s_sd = sub.add_parser("snapshot-daily", help="生成并落库每日策略快照")
+    s_sd.add_argument("--dry-run", action="store_true", help="仅预览，不写入SQLite")
+    s_sd.add_argument("--snapshot-date", default="", help="快照日期，默认今天 YYYY-MM-DD")
+    s_sd.add_argument("--allow-small-sample", action="store_true", default=True)
+    s_sd.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
+    s_sd.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
+    s_sd.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
+    s_sd.add_argument("--refresh-prices", action="store_true", help="先同步实时价格再快照")
+    s_sd.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
+
+    s_sn = sub.add_parser("sync-snapshot-notion", help="同步指定日期快照到Notion策略快照库")
+    s_sn.add_argument("--snapshot-date", default="", help="同步日期，默认今天 YYYY-MM-DD")
+    s_sn.add_argument("--dry-run", action="store_true", help="仅预览，不写入Notion")
+
+    s_hq = sub.add_parser("history-query", help="查询历史快照并输出JSON")
+    s_hq.add_argument("--start-date", default="", help="开始日期，默认今天 YYYY-MM-DD")
+    s_hq.add_argument("--end-date", default="", help="结束日期，默认开始日期 YYYY-MM-DD")
+    s_hq.add_argument("--strategies", default="", help="策略过滤，如 BASELINE,CHAN")
+    s_hq.add_argument("--markets", default="", help="市场过滤，如 SH,SZ,HK")
+
     return p
-
-
 def main() -> int:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(script_dir)
@@ -1404,6 +1933,9 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.cmd == "history-query":
+        return history_query(args)
 
     if not args.token:
         print("Missing NOTION_TOKEN.", file=sys.stderr)
@@ -1430,8 +1962,16 @@ def main() -> int:
         return backtest_recommendation(client, cfg, args)
     if args.cmd == "sync-prices":
         return sync_prices(client, cfg, args)
+    if args.cmd == "snapshot-daily":
+        return snapshot_daily(client, cfg, args)
+    if args.cmd == "sync-snapshot-notion":
+        return sync_snapshot_notion(client, cfg, args)
     return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
