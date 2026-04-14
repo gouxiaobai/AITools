@@ -949,6 +949,202 @@ def _recommend_from_points(
     }
 
 
+def _parse_strategy_set(raw: str) -> List[str]:
+    allowed = {"baseline", "chan", "atr_wave"}
+    items = [x.strip().lower() for x in (raw or "").split(",") if x.strip()]
+    if not items:
+        items = ["baseline", "chan", "atr_wave"]
+    items = [x for x in items if x in allowed]
+    if not items:
+        raise ValueError("strategy-set must include baseline/chan/atr_wave")
+    out: List[str] = []
+    for x in items:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _recommend_chan_from_points(
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    points: List[TradePoint],
+    allow_small_sample: bool,
+    min_confidence: str,
+) -> Dict[str, Any]:
+    base = _recommend_from_points(
+        current_price=current_price,
+        current_cost=current_cost,
+        points=points,
+        allow_small_sample=allow_small_sample,
+        min_confidence=min_confidence,
+    )
+    if current_price is None or current_price <= 0:
+        return base
+
+    prices = [p.price for p in points if p.price is not None and p.price > 0]
+    n = len(prices)
+    if n < 7:
+        base["reason"] = "CHAN sample too short; fallback baseline"
+        return base
+
+    fractals: List[Tuple[int, str]] = []
+    for i in range(1, n - 1):
+        if prices[i] > prices[i - 1] and prices[i] > prices[i + 1]:
+            fractals.append((i, "TOP"))
+        elif prices[i] < prices[i - 1] and prices[i] < prices[i + 1]:
+            fractals.append((i, "BOTTOM"))
+    pens: List[Tuple[int, int, str]] = []
+    for i in range(1, len(fractals)):
+        p0, t0 = fractals[i - 1]
+        p1, t1 = fractals[i]
+        if t0 == t1:
+            continue
+        direction = "UP" if (t0 == "BOTTOM" and t1 == "TOP") else "DOWN"
+        pens.append((p0, p1, direction))
+
+    recent = prices[-6:]
+    center = _safe_mean(recent)
+    spread = max(_safe_stdev(recent), 1e-6)
+    upper = center + spread * 0.6
+    lower = center - spread * 0.6
+    trend_up = len(pens) >= 2 and pens[-1][2] == "UP" and pens[-2][2] == "UP"
+    trend_down = len(pens) >= 2 and pens[-1][2] == "DOWN" and pens[-2][2] == "DOWN"
+
+    action = "HOLD"
+    reason = f"CHAN fractals={len(fractals)} pens={len(pens)} center={center:.4f}"
+    if trend_up and current_price <= upper:
+        action = "BUY"
+        reason = f"{reason}; up-pen continuation near center"
+    elif trend_down and current_price >= lower:
+        action = "SELL"
+        reason = f"{reason}; down-pen continuation near center"
+
+    buy_price = min(base["buy_price"], center) if base["buy_price"] is not None else center
+    sell_price = max(base["sell_price"], center) if base["sell_price"] is not None else center
+    stop_price = min(base["stop_price"], lower - spread * 0.4) if base["stop_price"] is not None else lower
+    conf = base["confidence"]
+    if n < 20 and conf == "HIGH":
+        conf = "MEDIUM"
+    if _level_rank(conf) < _level_rank(min_confidence):
+        action = "HOLD"
+        reason = f"CHAN confidence {conf} below threshold {min_confidence}"
+
+    pos = base["position_delta"]
+    if action == "BUY" and pos < 0:
+        pos = abs(pos)
+    if action == "SELL" and pos > 0:
+        pos = -abs(pos)
+    if action == "HOLD":
+        pos = 0.0
+
+    return {
+        "action": action,
+        "buy_price": round(float(buy_price), 4),
+        "sell_price": round(float(sell_price), 4),
+        "stop_price": round(float(stop_price), 4),
+        "position_delta": round(float(pos), 4),
+        "confidence": conf,
+        "mode": base["mode"],
+        "reason": reason,
+        "sample_count": base["sample_count"],
+    }
+
+
+def _recommend_atr_wave_from_points(
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    points: List[TradePoint],
+    allow_small_sample: bool,
+    min_confidence: str,
+) -> Dict[str, Any]:
+    base = _recommend_from_points(
+        current_price=current_price,
+        current_cost=current_cost,
+        points=points,
+        allow_small_sample=allow_small_sample,
+        min_confidence=min_confidence,
+    )
+    if current_price is None or current_price <= 0:
+        return base
+
+    closes = [p.price for p in points if p.price is not None and p.price > 0]
+    if len(closes) < 8:
+        base["reason"] = "ATR_WAVE sample too short; fallback baseline"
+        return base
+
+    diffs = [abs(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+    atr_window = min(14, len(diffs))
+    atr = _safe_mean(diffs[-atr_window:]) if atr_window > 0 else 0.0
+    ma_window = min(20, len(closes))
+    mid = _safe_mean(closes[-ma_window:]) if ma_window > 0 else current_price
+    upper = mid + atr * 1.2
+    lower = mid - atr * 1.2
+
+    action = "HOLD"
+    reason = f"ATR_WAVE atr={atr:.4f} mid={mid:.4f} band=[{lower:.4f},{upper:.4f}]"
+    if current_price > upper:
+        action = "BUY"
+        reason = f"{reason}; breakout above upper band"
+    elif current_price < lower:
+        action = "SELL"
+        reason = f"{reason}; breakdown below lower band"
+    elif abs(current_price - mid) <= max(atr * 0.25, 0.01):
+        action = "HOLD"
+        reason = f"{reason}; mean reversion zone"
+
+    buy_price = min(base["buy_price"], current_price - atr * 0.4) if base["buy_price"] is not None else current_price
+    sell_price = max(base["sell_price"], current_price + atr * 0.8) if base["sell_price"] is not None else current_price
+    stop_price = min(base["stop_price"], current_price - atr * 1.2) if base["stop_price"] is not None else current_price
+
+    conf = base["confidence"]
+    if len(closes) < 20 and conf == "HIGH":
+        conf = "MEDIUM"
+    if _level_rank(conf) < _level_rank(min_confidence):
+        action = "HOLD"
+        reason = f"ATR_WAVE confidence {conf} below threshold {min_confidence}"
+
+    pos = base["position_delta"]
+    if action == "BUY" and pos < 0:
+        pos = abs(pos)
+    if action == "SELL" and pos > 0:
+        pos = -abs(pos)
+    if action == "HOLD":
+        pos = 0.0
+
+    return {
+        "action": action,
+        "buy_price": round(float(buy_price), 4),
+        "sell_price": round(float(sell_price), 4),
+        "stop_price": round(float(stop_price), 4),
+        "position_delta": round(float(pos), 4),
+        "confidence": conf,
+        "mode": base["mode"],
+        "reason": reason,
+        "sample_count": base["sample_count"],
+    }
+
+
+def _recommend_by_strategy(
+    strategy_id: str,
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    points: List[TradePoint],
+    allow_small_sample: bool,
+    min_confidence: str,
+) -> Dict[str, Any]:
+    sid = strategy_id.lower()
+    if sid == "baseline":
+        rec = _recommend_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+    elif sid == "chan":
+        rec = _recommend_chan_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+    elif sid == "atr_wave":
+        rec = _recommend_atr_wave_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+    else:
+        raise ValueError(f"unsupported strategy: {strategy_id}")
+    rec["strategy_id"] = sid.upper()
+    return rec
+
+
 def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
     stock_db = client.get_database(cfg.stock_master_id)
     trade_db = client.get_database(cfg.std_trades_id)
@@ -973,36 +1169,51 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
     db_props = stock_db.get("properties", {})
     asof_date = args.asof_date or dt.date.today().isoformat()
 
+    selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
     recs: List[Dict[str, Any]] = []
     for row in stock_rows:
         stock_id = row.get("id", "")
         title = p_title(row, stock_fields["title"]) if stock_fields["title"] else stock_id
         current_price = p_number(row, stock_fields["current_price"]) if stock_fields["current_price"] else None
         current_cost = p_number(row, stock_fields["current_cost"]) if stock_fields["current_cost"] else None
-        rec = _recommend_from_points(
-            current_price=current_price,
-            current_cost=current_cost,
-            points=stock_points.get(stock_id, []),
-            allow_small_sample=args.allow_small_sample,
-            min_confidence=args.min_confidence,
-        )
-        rec["stock_id"] = stock_id
-        rec["stock_name"] = title
-        recs.append(rec)
+        stock_recs: List[Dict[str, Any]] = []
+        for sid in selected_strategies:
+            rec = _recommend_by_strategy(
+                strategy_id=sid,
+                current_price=current_price,
+                current_cost=current_cost,
+                points=stock_points.get(stock_id, []),
+                allow_small_sample=args.allow_small_sample,
+                min_confidence=args.min_confidence,
+            )
+            rec["stock_id"] = stock_id
+            rec["stock_name"] = title
+            stock_recs.append(rec)
+            recs.append(rec)
 
         if args.dry_run:
             continue
 
+        rec_for_write = None
+        for r in stock_recs:
+            if r.get("strategy_id") == "BASELINE":
+                rec_for_write = r
+                break
+        if rec_for_write is None and stock_recs:
+            rec_for_write = stock_recs[0]
+        if rec_for_write is None:
+            continue
+
         props: Dict[str, Any] = {}
         write_map = [
-            (stock_fields["out_action"], rec["action"]),
-            (stock_fields["out_buy"], rec["buy_price"]),
-            (stock_fields["out_sell"], rec["sell_price"]),
-            (stock_fields["out_stop"], rec["stop_price"]),
-            (stock_fields["out_pos"], rec["position_delta"]),
-            (stock_fields["out_conf"], rec["confidence"]),
-            (stock_fields["out_mode"], rec["mode"]),
-            (stock_fields["out_reason"], rec["reason"]),
+            (stock_fields["out_action"], rec_for_write["action"]),
+            (stock_fields["out_buy"], rec_for_write["buy_price"]),
+            (stock_fields["out_sell"], rec_for_write["sell_price"]),
+            (stock_fields["out_stop"], rec_for_write["stop_price"]),
+            (stock_fields["out_pos"], rec_for_write["position_delta"]),
+            (stock_fields["out_conf"], rec_for_write["confidence"]),
+            (stock_fields["out_mode"], rec_for_write["mode"]),
+            (stock_fields["out_reason"], f"[{rec_for_write['strategy_id']}] {rec_for_write['reason']}"),
             (stock_fields["out_time"], asof_date),
         ]
         for prop_name, value in write_map:
@@ -1055,7 +1266,12 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
     trade_rows = client.query_database_all(cfg.std_trades_id)
     stock_points = _build_trade_points(trade_rows, trade_fields)
 
+    selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
     mode_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_mode_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_hold_counts: Dict[str, int] = defaultdict(int)
+    strategy_total_counts: Dict[str, int] = defaultdict(int)
     baseline_returns: List[float] = []
     all_strategy_returns: List[float] = []
 
@@ -1069,21 +1285,7 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
             nxt = valid[idx + 1]
             if not curr.price or not nxt.price:
                 continue
-            rec = _recommend_from_points(
-                current_price=curr.price,
-                current_cost=None,
-                points=hist,
-                allow_small_sample=args.allow_small_sample,
-                min_confidence=args.min_confidence,
-            )
-
             move = (nxt.price - curr.price) / curr.price
-            if rec["action"] == "BUY":
-                strategy_ret = move
-            elif rec["action"] == "SELL":
-                strategy_ret = -move
-            else:
-                strategy_ret = 0.0
 
             actual_dir = curr.direction
             if actual_dir == "BUY":
@@ -1093,14 +1295,47 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
             else:
                 baseline_ret = 0.0
 
-            mode_returns[rec["mode"]].append(strategy_ret)
             baseline_returns.append(baseline_ret)
-            all_strategy_returns.append(strategy_ret)
+            for sid in selected_strategies:
+                rec = _recommend_by_strategy(
+                    strategy_id=sid,
+                    current_price=curr.price,
+                    current_cost=None,
+                    points=hist,
+                    allow_small_sample=args.allow_small_sample,
+                    min_confidence=args.min_confidence,
+                )
+
+                if rec["action"] == "BUY":
+                    strategy_ret = move
+                elif rec["action"] == "SELL":
+                    strategy_ret = -move
+                else:
+                    strategy_ret = 0.0
+
+                sid_upper = rec["strategy_id"]
+                strategy_total_counts[sid_upper] += 1
+                if rec["action"] == "HOLD":
+                    strategy_hold_counts[sid_upper] += 1
+                strategy_returns[sid_upper].append(strategy_ret)
+                strategy_mode_returns[f"{sid_upper}:{rec['mode']}"].append(strategy_ret)
+                mode_returns[rec["mode"]].append(strategy_ret)
+                all_strategy_returns.append(strategy_ret)
+
+    strategy_metrics: Dict[str, Dict[str, float]] = {}
+    for sid, arr in strategy_returns.items():
+        m = _returns_metrics(arr)
+        total = max(strategy_total_counts.get(sid, 0), 1)
+        hold_ratio = strategy_hold_counts.get(sid, 0) / total
+        m["hold_ratio"] = hold_ratio
+        strategy_metrics[sid] = m
 
     out = {
         "baseline": _returns_metrics(baseline_returns),
         "strategy_all": _returns_metrics(all_strategy_returns),
         "strategy_by_mode": {k: _returns_metrics(v) for k, v in mode_returns.items()},
+        "strategy_metrics": strategy_metrics,
+        "strategy_mode_metrics": {k: _returns_metrics(v) for k, v in strategy_mode_returns.items()},
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -1144,6 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_rec.add_argument("--allow-small-sample", action="store_true", default=True)
     s_rec.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_rec.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
+    s_rec.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
     s_rec.add_argument("--refresh-prices", action="store_true", help="先自动拉取实时当前市价，再计算建议")
     s_rec.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
 
@@ -1152,6 +1388,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_bt.add_argument("--allow-small-sample", action="store_true", default=True)
     s_bt.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_bt.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
+    s_bt.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
 
     s_sp = sub.add_parser("sync-prices", help="自动拉取实时行情并回写当前市价")
     s_sp.add_argument("--dry-run", action="store_true", help="仅拉取并输出统计，不写入Notion")

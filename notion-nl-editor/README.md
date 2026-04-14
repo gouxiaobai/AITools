@@ -69,6 +69,10 @@ python src\stock_pipeline.py recommend-prices --refresh-prices --min-confidence 
 
 # 10) Backtest recommendation model
 python src\stock_pipeline.py backtest-recommendation --window 60 --min-confidence MEDIUM
+
+# 11) Run parallel strategies (BASELINE + CHAN + ATR_WAVE)
+python src\stock_pipeline.py recommend-prices --dry-run --strategy-set baseline,chan,atr_wave
+python src\stock_pipeline.py backtest-recommendation --window 60 --strategy-set baseline,chan,atr_wave
 ```
 
 ## Visual Dashboard
