@@ -85,6 +85,18 @@ python src\stock_pipeline.py sync-snapshot-notion --snapshot-date 2026-04-14
 
 # 15) Query history from SQLite
 python src\stock_pipeline.py history-query --start-date 2026-04-01 --end-date 2026-04-14 --strategies BASELINE,CHAN --markets SH,SZ
+
+# 16) Generate param proposals from history snapshots
+python src\stock_pipeline.py param-recommend --start-date 2026-04-01 --end-date 2026-04-14 --strategies BASELINE,CHAN
+
+# 17) Diff current/recommended/manual params
+python src\stock_pipeline.py param-diff --proposal-id abc123def456 --editor-json "{\"band_low\":0.012}"
+
+# 18) Apply params (idempotent + version guard)
+python src\stock_pipeline.py param-apply --proposal-id abc123def456 --editor-json "{\"band_low\":0.012}" --expected-version 3
+
+# 19) Rollback one apply operation
+python src\stock_pipeline.py param-rollback --apply-log-id 9a8b7c6d5e4f
 ```
 
 ## Visual Dashboard

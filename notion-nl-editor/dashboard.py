@@ -21,6 +21,11 @@ from stock_pipeline import (  # noqa: E402
     history_query,
     load_cfg,
     load_dotenv,
+    param_apply,
+    param_diff,
+    param_draft_save,
+    param_recommend,
+    param_rollback,
     recommend_prices,
     snapshot_daily,
     sync_prices,
@@ -185,7 +190,9 @@ def main() -> None:
         st.stop()
 
     _show_run_status()
-    tab_price, tab_signal, tab_backtest, tab_history = st.tabs(["实时行情", "交易建议", "回测分析", "历史追踪"])
+    tab_price, tab_signal, tab_backtest, tab_history, tab_param = st.tabs(
+        ["实时行情", "交易建议", "回测分析", "历史追踪", "参数调优"]
+    )
 
     with tab_price:
         st.subheader("实时行情同步")
@@ -315,6 +322,151 @@ def main() -> None:
                 st.success("历史查询完成")
                 _mark_run("历史查询", True, "历史趋势已刷新")
                 _render_history_result(parsed, raw)
+
+    with tab_param:
+        st.subheader("参数应用工作台")
+        st.caption("1) 生成推荐  2) 人工调整  3) 预检并应用")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        p1, p2 = st.columns(2)
+        pr_start = p1.text_input("推荐开始日期", value=today_str, key="param_start")
+        pr_end = p2.text_input("推荐结束日期", value=today_str, key="param_end")
+        p3, p4 = st.columns(2)
+        pr_strategies = p3.multiselect("策略", options=["BASELINE", "CHAN", "ATR_WAVE"], default=["BASELINE", "CHAN", "ATR_WAVE"])
+        pr_markets = p4.multiselect("市场", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
+        dry_param_rec = st.checkbox("仅预览推荐，不落库", value=False, key="param_rec_dry")
+
+        if st.button("生成推荐参数", type="primary", use_container_width=True):
+            args = argparse.Namespace(
+                start_date=pr_start,
+                end_date=pr_end,
+                strategies=",".join(pr_strategies),
+                markets=",".join(pr_markets),
+                dry_run=dry_param_rec,
+            )
+            code, raw, parsed, run_err = _run_and_capture(param_recommend, args)
+            if run_err or code != 0:
+                msg = run_err or raw or "参数推荐生成失败"
+                st.error(msg)
+                _mark_run("参数推荐", False, msg)
+            else:
+                st.success("参数推荐生成完成")
+                _mark_run("参数推荐", True, "参数推荐已生成")
+                st.session_state["param_last_recommend"] = parsed
+                _show_json_debug("参数推荐结果", raw)
+
+        rec_obj = st.session_state.get("param_last_recommend", {})
+        proposals = rec_obj.get("proposals", []) if isinstance(rec_obj, dict) else []
+        if proposals:
+            pro_df = pd.DataFrame(
+                [
+                    {
+                        "proposal_id": x.get("proposal_id", ""),
+                        "strategy_id": x.get("strategy_id", ""),
+                        "market": x.get("market", ""),
+                        "score": x.get("score", 0.0),
+                        "sample_count": x.get("sample_count", 0),
+                        "created_at": x.get("created_at", ""),
+                    }
+                    for x in proposals
+                ]
+            )
+            st.dataframe(pro_df, use_container_width=True, hide_index=True)
+            selected_proposal = st.selectbox("选择推荐ID", options=pro_df["proposal_id"].tolist(), key="param_selected_proposal")
+
+            draft_key = f"param_editor_values_{selected_proposal}"
+            if draft_key not in st.session_state:
+                st.session_state[draft_key] = {}
+            if st.button("加载并预检参数差异", use_container_width=True):
+                diff_args = argparse.Namespace(proposal_id=selected_proposal, editor_json=json.dumps(st.session_state[draft_key], ensure_ascii=False))
+                code, raw, parsed, run_err = _run_and_capture(param_diff, diff_args)
+                if run_err or code != 0:
+                    msg = run_err or raw or "参数差异预检失败"
+                    st.error(msg)
+                    _mark_run("参数预检", False, msg)
+                else:
+                    st.session_state["param_last_diff"] = parsed
+                    _mark_run("参数预检", True, "参数差异已刷新")
+                    _show_json_debug("参数差异结果", raw)
+
+            diff_obj = st.session_state.get("param_last_diff", {})
+            if isinstance(diff_obj, dict) and diff_obj.get("proposal_id") == selected_proposal:
+                rows = diff_obj.get("rows", [])
+                if isinstance(rows, list) and rows:
+                    df_rows = pd.DataFrame(
+                        [
+                            {
+                                "参数名": r.get("param_name"),
+                                "当前值": r.get("current_value"),
+                                "推荐值": r.get("recommended_value"),
+                                "你的值": r.get("your_value"),
+                                "变更幅度": float(r.get("delta_pct", 0.0)),
+                                "风险提示": r.get("risk"),
+                                "校验": "通过" if r.get("valid") else f"失败: {r.get('error', '')}",
+                                "changed": bool(r.get("changed", False)),
+                            }
+                            for r in rows
+                        ]
+                    )
+                    only_changed = st.checkbox("仅显示有变化项", value=True, key="param_only_changed")
+                    view_df = df_rows[df_rows["changed"]] if only_changed else df_rows
+                    edit_df = st.data_editor(
+                        view_df[["参数名", "当前值", "推荐值", "你的值", "变更幅度", "风险提示", "校验"]],
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=["参数名", "当前值", "推荐值", "变更幅度", "风险提示", "校验"],
+                        key="param_editor_grid",
+                    )
+                    editor_map: Dict[str, Any] = {}
+                    for _, row in edit_df.iterrows():
+                        editor_map[str(row["参数名"])] = row["你的值"]
+                    st.session_state[draft_key] = editor_map
+                    _run_and_capture(param_draft_save, argparse.Namespace(proposal_id=selected_proposal, editor_json=json.dumps(editor_map, ensure_ascii=False)))
+
+                    recheck_args = argparse.Namespace(proposal_id=selected_proposal, editor_json=json.dumps(editor_map, ensure_ascii=False))
+                    r_code, r_raw, r_parsed, r_err = _run_and_capture(param_diff, recheck_args)
+                    if not r_err and r_code == 0 and isinstance(r_parsed, dict):
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("将修改项", int(r_parsed.get("changed_count", 0)))
+                        c2.metric("影响策略", 1)
+                        c3.metric("高风险项", int(r_parsed.get("high_risk_count", 0)))
+                        confirm_apply = st.checkbox("我确认应用以上参数变更", value=False, key="param_confirm_apply")
+                        ap1, ap2 = st.columns(2)
+                        if ap1.button("应用参数", type="primary", use_container_width=True, disabled=not confirm_apply):
+                            apply_args = argparse.Namespace(
+                                proposal_id=selected_proposal,
+                                editor_json=json.dumps(editor_map, ensure_ascii=False),
+                                expected_version=int(r_parsed.get("current_version", -1)),
+                                operator=os.getenv("OPERATOR", "local_user"),
+                                comment="dashboard_apply",
+                            )
+                            a_code, a_raw, a_parsed, a_err = _run_and_capture(param_apply, apply_args)
+                            if a_err or a_code != 0:
+                                msg = a_err or a_raw or "参数应用失败"
+                                st.error(msg)
+                                _mark_run("参数应用", False, msg)
+                            else:
+                                st.success("参数应用成功")
+                                _mark_run("参数应用", True, "参数已生效")
+                                st.session_state["param_last_apply"] = a_parsed
+                                _show_json_debug("参数应用结果", a_raw)
+                        last_apply = st.session_state.get("param_last_apply", {})
+                        rollback_id = last_apply.get("apply_log_id", "") if isinstance(last_apply, dict) else ""
+                        if ap2.button("回滚上次应用", use_container_width=True, disabled=not bool(rollback_id)):
+                            roll_args = argparse.Namespace(
+                                apply_log_id=rollback_id,
+                                operator=os.getenv("OPERATOR", "local_user"),
+                                comment="dashboard_rollback",
+                            )
+                            rb_code, rb_raw, rb_parsed, rb_err = _run_and_capture(param_rollback, roll_args)
+                            if rb_err or rb_code != 0:
+                                msg = rb_err or rb_raw or "回滚失败"
+                                st.error(msg)
+                                _mark_run("参数回滚", False, msg)
+                            else:
+                                st.success("回滚成功")
+                                _mark_run("参数回滚", True, "参数已回滚")
+                                st.session_state["param_last_apply"] = rb_parsed
+                                _show_json_debug("参数回滚结果", rb_raw)
 
     st.markdown("---")
     st.caption("建议：先同步实时行情，再生成建议，最后做快照与历史查询。")

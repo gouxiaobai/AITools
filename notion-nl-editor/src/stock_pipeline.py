@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import requests
 from requests import exceptions as req_exc
+from param_store import ParamStore
 
 
 def load_dotenv(path: str) -> None:
@@ -1683,6 +1684,16 @@ def _split_csv(raw: str) -> List[str]:
     return [x.strip() for x in (raw or "").split(",") if x.strip()]
 
 
+def _load_json_arg(raw: str) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    if os.path.exists(text):
+        with open(text, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(text)
+
+
 def _history_payload(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     by_strategy: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -1744,6 +1755,115 @@ def history_query(args: argparse.Namespace) -> int:
     finally:
         store.close()
     print(json.dumps(_history_payload(rows), ensure_ascii=False, indent=2))
+    return 0
+
+
+def param_recommend(args: argparse.Namespace) -> int:
+    start_date = _today_or(getattr(args, "start_date", ""))
+    end_date = _today_or(getattr(args, "end_date", "")) if getattr(args, "end_date", "") else start_date
+    strategies = [x.upper() for x in _split_csv(getattr(args, "strategies", ""))]
+    markets = [x.upper() for x in _split_csv(getattr(args, "markets", ""))]
+
+    snap = SnapshotStore(_sqlite_path())
+    try:
+        rows = snap.query_range(start_date, end_date, strategies=strategies or None, markets=markets or None)
+    finally:
+        snap.close()
+
+    run_id = uuid4().hex[:12]
+    store = ParamStore(_sqlite_path())
+    try:
+        out_rows = store.create_proposals_from_history(
+            snapshot_rows=rows,
+            source_start_date=start_date,
+            source_end_date=end_date,
+            run_id=run_id,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    finally:
+        store.close()
+
+    print(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "source_start_date": start_date,
+                "source_end_date": end_date,
+                "proposal_count": len(out_rows),
+                "dry_run": bool(getattr(args, "dry_run", False)),
+                "proposals": out_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def param_diff(args: argparse.Namespace) -> int:
+    proposal_id = (getattr(args, "proposal_id", "") or "").strip()
+    if not proposal_id:
+        raise RuntimeError("proposal-id is required")
+    editor_values = _load_json_arg(getattr(args, "editor_json", ""))
+    store = ParamStore(_sqlite_path())
+    try:
+        out = store.diff(proposal_id, editor_values=editor_values or None)
+    finally:
+        store.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def param_apply(args: argparse.Namespace) -> int:
+    proposal_id = (getattr(args, "proposal_id", "") or "").strip()
+    if not proposal_id:
+        raise RuntimeError("proposal-id is required")
+    editor_values = _load_json_arg(getattr(args, "editor_json", ""))
+    operator = (getattr(args, "operator", "") or os.getenv("OPERATOR", "local_user")).strip() or "local_user"
+    comment = getattr(args, "comment", "") or ""
+    expected_version = int(getattr(args, "expected_version", -1))
+
+    store = ParamStore(_sqlite_path())
+    try:
+        out = store.apply(
+            proposal_id=proposal_id,
+            editor_values=editor_values or None,
+            operator=operator,
+            comment=comment,
+            expected_version=expected_version if expected_version >= 0 else None,
+        )
+    finally:
+        store.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def param_rollback(args: argparse.Namespace) -> int:
+    apply_log_id = (getattr(args, "apply_log_id", "") or "").strip()
+    if not apply_log_id:
+        raise RuntimeError("apply-log-id is required")
+    operator = (getattr(args, "operator", "") or os.getenv("OPERATOR", "local_user")).strip() or "local_user"
+    comment = getattr(args, "comment", "") or ""
+    store = ParamStore(_sqlite_path())
+    try:
+        out = store.rollback(apply_log_id=apply_log_id, operator=operator, comment=comment)
+    finally:
+        store.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def param_draft_save(args: argparse.Namespace) -> int:
+    proposal_id = (getattr(args, "proposal_id", "") or "").strip()
+    if not proposal_id:
+        raise RuntimeError("proposal-id is required")
+    editor_values = _load_json_arg(getattr(args, "editor_json", ""))
+    store = ParamStore(_sqlite_path())
+    try:
+        out = store.save_draft(proposal_id=proposal_id, editor_values=editor_values)
+    finally:
+        store.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1925,6 +2045,33 @@ def build_parser() -> argparse.ArgumentParser:
     s_hq.add_argument("--strategies", default="", help="策略过滤，如 BASELINE,CHAN")
     s_hq.add_argument("--markets", default="", help="市场过滤，如 SH,SZ,HK")
 
+    s_pr = sub.add_parser("param-recommend", help="基于历史快照生成参数推荐")
+    s_pr.add_argument("--start-date", default="", help="开始日期，默认今天 YYYY-MM-DD")
+    s_pr.add_argument("--end-date", default="", help="结束日期，默认开始日期 YYYY-MM-DD")
+    s_pr.add_argument("--strategies", default="", help="策略过滤，如 BASELINE,CHAN")
+    s_pr.add_argument("--markets", default="", help="市场过滤，如 SH,SZ,HK")
+    s_pr.add_argument("--dry-run", action="store_true", help="仅计算推荐，不写入proposal表")
+
+    s_pd = sub.add_parser("param-diff", help="比较当前值、推荐值、人工编辑值")
+    s_pd.add_argument("--proposal-id", required=True, help="参数推荐ID")
+    s_pd.add_argument("--editor-json", default="", help="人工编辑JSON文本或json文件路径")
+
+    s_pa = sub.add_parser("param-apply", help="应用参数推荐（支持人工编辑）")
+    s_pa.add_argument("--proposal-id", required=True, help="参数推荐ID")
+    s_pa.add_argument("--editor-json", default="", help="人工编辑JSON文本或json文件路径")
+    s_pa.add_argument("--expected-version", type=int, default=-1, help="并发保护版本号，-1表示不校验")
+    s_pa.add_argument("--operator", default="", help="操作者，默认取 OPERATOR 或 local_user")
+    s_pa.add_argument("--comment", default="", help="应用备注")
+
+    s_proll = sub.add_parser("param-rollback", help="按 apply_log_id 回滚参数")
+    s_proll.add_argument("--apply-log-id", required=True, help="apply_log_id")
+    s_proll.add_argument("--operator", default="", help="操作者，默认取 OPERATOR 或 local_user")
+    s_proll.add_argument("--comment", default="", help="回滚备注")
+
+    s_pdraft = sub.add_parser("param-draft-save", help="保存参数编辑草稿")
+    s_pdraft.add_argument("--proposal-id", required=True, help="参数推荐ID")
+    s_pdraft.add_argument("--editor-json", default="", help="人工编辑JSON文本或json文件路径")
+
     return p
 def main() -> int:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1936,6 +2083,16 @@ def main() -> int:
 
     if args.cmd == "history-query":
         return history_query(args)
+    if args.cmd == "param-recommend":
+        return param_recommend(args)
+    if args.cmd == "param-diff":
+        return param_diff(args)
+    if args.cmd == "param-apply":
+        return param_apply(args)
+    if args.cmd == "param-rollback":
+        return param_rollback(args)
+    if args.cmd == "param-draft-save":
+        return param_draft_save(args)
 
     if not args.token:
         print("Missing NOTION_TOKEN.", file=sys.stderr)
