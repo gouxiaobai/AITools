@@ -1,0 +1,58 @@
+{
+  "name": "basic_regression_suite",
+  "cases": [
+    {
+      "name": "month_card_daily_reward",
+      "steps": [
+        {
+          "action": 19660,
+          "params": {},
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "week_card_sync_info",
+      "steps": [
+        {
+          "action": 19650,
+          "params": {
+            "activityId": 0
+          },
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mail_sync_info",
+      "steps": [
+        {
+          "action": 50006,
+          "params": {
+            "maxMailId": 0,
+            "mailSyncVersion": 0
+          },
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

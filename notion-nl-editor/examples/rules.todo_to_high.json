@@ -1,0 +1,9 @@
+﻿{
+  "description": "Set priority to High for TODO rows",
+  "filters": [
+    {"property": "状态", "type": "select", "op": "equals", "value": "待处理"}
+  ],
+  "updates": {
+    "优先级": {"type": "select", "value": "高"}
+  }
+}

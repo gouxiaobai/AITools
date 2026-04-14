@@ -1,0 +1,1019 @@
+﻿<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TCP Proxy Tool</title>
+<style>
+  :root {
+    --bg: #1e1e2e; --panel: #252535; --border: #3a3a5c;
+    --text: #cdd6f4; --muted: #6c7086; --accent: #89b4fa;
+    --green: #a6e3a1; --red: #f38ba8; --yellow: #f9e2af;
+    --purple: #cba6f7; --teal: #94e2d5;
+    --row-hover: #2e2e4e; --row-sel: #313155;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.5 'Consolas','Cascadia Code',monospace; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Header */
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
+  header h1 { font-size: 14px; color: var(--accent); white-space: nowrap; }
+  .status-chip { font-size: 11px; color: var(--muted); background: #1a1a2e; padding: 2px 8px; border-radius: 12px; }
+  .status-chip span { color: var(--green); }
+  .hdr-right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input[type=text], input[type=number] { background: #1a1a2e; border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 4px; font: inherit; }
+  input[type=text]:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
+  select { background: #1a1a2e; border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 4px; font: inherit; cursor: pointer; }
+  button { background: var(--accent); color: #1e1e2e; border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font: inherit; font-weight: 600; white-space: nowrap; }
+  button:hover { filter: brightness(1.15); }
+  button.danger { background: var(--red); }
+  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); font-weight: normal; }
+  button.secondary:hover { border-color: var(--accent); }
+  label { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 12px; color: var(--muted); }
+  label input[type=checkbox] { cursor: pointer; }
+
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Packet list */
+  .pkt-panel { width: 420px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  .pkt-toolbar { display: flex; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  .pkt-toolbar input[type=text] { flex: 1; min-width: 80px; }
+  .pkt-list { flex: 1; overflow-y: auto; }
+  .pkt-row { display: grid; grid-template-columns: 30px 42px 72px 1fr 64px; align-items: center; gap: 6px; padding: 4px 10px; border-bottom: 1px solid #2a2a3e; cursor: pointer; }
+  .pkt-row:hover { background: var(--row-hover); }
+  .pkt-row.selected { background: var(--row-sel); border-left: 2px solid var(--accent); padding-left: 8px; }
+  .pkt-id { color: var(--muted); font-size: 11px; }
+  .dir-badge { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px; text-align: center; }
+  .dir-c2s { background: #1e3a2e; color: var(--green); }
+  .dir-s2c { background: #3a1e1e; color: var(--red); }
+  .pkt-action { color: var(--yellow); font-size: 12px; }
+  .pkt-name { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pkt-time { color: var(--muted); font-size: 10px; text-align: right; }
+  .pkt-note { font-size: 10px; color: var(--purple); margin-left: 4px; }
+
+  /* Detail panel */
+  .detail-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .detail-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .tab-btn { padding: 7px 16px; cursor: pointer; font-size: 12px; color: var(--muted); border-bottom: 2px solid transparent; background: none; border-radius: 0; font-weight: normal; }
+  .tab-btn:hover { color: var(--text); filter: none; }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { flex: 1; overflow: hidden; display: none; flex-direction: column; }
+  .tab-content.active { display: flex; }
+
+  /* detail view */
+  .detail-header { padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-shrink: 0; flex-wrap: wrap; }
+  .detail-meta { display: flex; gap: 10px; font-size: 12px; flex-wrap: wrap; }
+  .detail-meta .kv span { color: var(--muted); }
+  .detail-body { flex: 1; overflow: auto; padding: 10px 14px; }
+  .json-view { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.6; }
+  .json-key { color: var(--accent); }
+  .json-str { color: var(--green); }
+  .json-num { color: var(--yellow); }
+  .json-bool { color: var(--purple); }
+  .json-null { color: var(--muted); }
+
+  /* edit view */
+  .edit-area { flex: 1; padding: 10px 14px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+  textarea { flex: 1; min-height: 160px; background: #1a1a2e; border: 1px solid var(--border); color: var(--text); padding: 8px; border-radius: 4px; font: inherit; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .edit-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .edit-actions input[type=number] { width: 70px; }
+
+  /* send panel */
+  .send-area { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+  .send-row { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+  .send-row label { color: var(--muted); font-size: 12px; padding-top: 5px; white-space: nowrap; }
+  .field-group { display: flex; flex-direction: column; gap: 4px; }
+  .field-group small { color: var(--muted); font-size: 11px; }
+  .template-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px; }
+  .tpl-btn { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 5px 10px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
+  .tpl-btn:hover { border-color: var(--accent); color: var(--accent); filter: none; }
+  .tpl-action { color: var(--yellow); margin-right: 6px; }
+  .tpl-name { color: var(--muted); font-size: 11px; }
+  h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .test-area { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+  .test-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .test-toolbar select { min-width: 260px; }
+  .test-status { background: #1a1a2e; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 12px; white-space: pre-wrap; line-height: 1.6; }
+  .runs-list { background: #1a1a2e; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .run-row { display: grid; grid-template-columns: 1fr 80px 90px 120px 130px; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #2a2a3e; align-items: center; font-size: 12px; }
+  .run-row:last-child { border-bottom: none; }
+  .run-row b { color: var(--accent); cursor: pointer; }
+  .suite-editor { background: #1a1a2e; border: 1px solid var(--border); border-radius: 6px; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .suite-editor .head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .case-card { border: 1px solid #2a2a3e; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .case-head { display: flex; gap: 8px; align-items: center; }
+  .step-card { border: 1px dashed #3a3a5c; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .step-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .expect-row { display: grid; grid-template-columns: 100px 1fr 1fr 70px; gap: 6px; align-items: center; }
+  .mono { font-family: 'Consolas','Cascadia Code',monospace; }
+
+  /* hex view */
+  .hex-view { font-size: 12px; line-height: 1.8; padding: 10px 14px; overflow: auto; color: var(--teal); word-break: break-all; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+  /* setup guide */
+  .setup-card { background: #1a2a1a; border: 1px solid #2d4a2d; border-radius: 6px; padding: 10px 16px; margin: 10px 14px; font-size: 12px; }
+  .setup-card h4 { color: var(--green); margin-bottom: 6px; font-size: 12px; }
+  .setup-steps { display: flex; gap: 24px; flex-wrap: wrap; }
+  .setup-step { display: flex; align-items: flex-start; gap: 8px; }
+  .step-num { background: var(--green); color: #1e1e2e; border-radius: 50%; width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; flex-shrink: 0; margin-top: 1px; }
+  .step-txt { color: var(--text); line-height: 1.6; }
+  .step-txt b { color: var(--yellow); }
+  .setup-card.warn { background: #2a1a1a; border-color: #4a2d2d; }
+  .setup-card.warn h4 { color: var(--red); }
+
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--accent); color: #1e1e2e; padding: 8px 16px; border-radius: 6px; font-weight: 600; animation: fadein .2s; z-index: 999; }
+  .toast.err { background: var(--red); }
+  @keyframes fadein { from { opacity: 0; transform: translateY(10px); } }
+  .empty-hint { color: var(--muted); font-size: 12px; text-align: center; padding: 40px 20px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <h1>TCP 代理工具</h1>
+  <div class="status-chip">连接数 <span id="connCount">0</span></div>
+  <div class="status-chip">包数 <span id="pktCount">0</span></div>
+  <div class="status-chip">Token <span id="tokenDisp">-</span></div>
+  <div class="hdr-right">
+    <input type="text" id="filterAction" placeholder="过滤 Action..." style="width:110px" oninput="applyFilter()">
+    <select id="filterDir" onchange="applyFilter()">
+      <option value="">全部方向</option>
+      <option value="C2S">C2S</option>
+      <option value="S2C">S2C</option>
+    </select>
+    <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+    <button class="secondary" onclick="exportJSON()">导出 JSON</button>
+    <button class="danger" onclick="clearAll()">清空</button>
+  </div>
+</header>
+
+<!-- Setup guide -->
+<div id="setupGuide" style="flex-shrink:0"></div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Left packet list -->
+  <div class="pkt-panel">
+    <div class="pkt-toolbar">
+      <input type="text" id="searchBox" placeholder="搜索内容..." style="flex:1" oninput="applyFilter()">
+    </div>
+    <div class="pkt-list" id="pktList">
+      <div class="empty-hint">等待数据包...</div>
+    </div>
+  </div>
+
+  <!-- Right detail panel -->
+  <div class="detail-panel">
+    <div class="detail-tabs">
+      <button class="tab-btn active" onclick="switchTab('view')">查看</button>
+      <button class="tab-btn" onclick="switchTab('edit')">编辑 / 重放</button>
+      <button class="tab-btn" onclick="switchTab('hex')">HEX</button>
+      <button class="tab-btn" onclick="switchTab('send')">发包</button>
+      <button class="tab-btn" onclick="switchTab('test')">自动化</button>
+    </div>
+
+    <!-- View tab -->
+    <div class="tab-content active" id="tab-view">
+      <div class="detail-header" id="detailHeader">
+        <span style="color:var(--muted);font-size:12px">点击左侧数据包查看详情。</span>
+      </div>
+      <div class="detail-body">
+        <div class="json-view" id="jsonView"></div>
+      </div>
+    </div>
+
+    <!-- Edit tab -->
+    <div class="tab-content" id="tab-edit">
+      <div class="edit-area">
+        <h3>重放已编辑数据包</h3>
+        <small style="color:var(--muted)">仅支持 C2S 重放。commReq 会自动重建。</small>
+        <textarea id="editArea" placeholder="先选择一个 C2S 包，再在此编辑 JSON..." rows="12"></textarea>
+        <div class="edit-actions">
+          <button onclick="replayEdited()">重放</button>
+          <label style="color:var(--muted)">连接:</label>
+          <input type="number" id="replayConn" value="0" min="0" style="width:55px">
+          <button class="secondary" onclick="formatEditor()">格式化 JSON</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- HEX tab -->
+    <div class="tab-content" id="tab-hex">
+      <div class="hex-view" id="hexView">选择数据包后显示原始 HEX...</div>
+    </div>
+
+    <!-- Send tab -->
+    <div class="tab-content" id="tab-send">
+      <div class="send-area">
+        <h3>快捷模板</h3>
+        <div class="template-grid" id="templateGrid"></div>
+
+        <h3 style="margin-top:8px">自定义发包</h3>
+        <div class="send-row">
+          <div class="field-group">
+            <label>Action</label>
+            <input type="number" id="sendAction" style="width:100px" placeholder="19660">
+          </div>
+          <div class="field-group" style="flex:1">
+            <label>参数 (JSON)</label>
+            <textarea id="sendParams" rows="8" placeholder='{"activityId": 123}'></textarea>
+          </div>
+        </div>
+        <div class="edit-actions">
+          <button onclick="sendCustom()">发送</button>
+          <label style="color:var(--muted)">连接:</label>
+          <input type="number" id="sendConn" value="0" min="0" style="width:55px">
+          <div id="sendResult" style="font-size:12px;color:var(--muted)"></div>
+        </div>
+
+        <h3 style="margin-top:8px">Token</h3>
+        <div class="send-row">
+          <input type="text" id="tokenInput" placeholder="粘贴 token..." style="flex:1">
+          <button class="secondary" onclick="setToken()">设置 Token</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Test tab -->
+    <div class="tab-content" id="tab-test">
+      <div class="test-area">
+        <h3>上传并运行测试用例</h3>
+        <div class="test-toolbar">
+          <label style="color:var(--muted)">测试用例:</label>
+          <input type="file" id="suiteXlsxFile" accept=".xlsx" style="max-width:260px">
+          <button class="secondary" onclick="downloadSuiteTemplate()">下载模板</button>
+          <label style="color:var(--muted)">连接:</label>
+          <input type="number" id="testConn" value="0" min="0" style="width:55px">
+          <button onclick="startTestRun()">开始运行</button>
+          <button class="danger" onclick="stopTestRun()">停止</button>
+          <button class="secondary" onclick="refreshTestRuns()">刷新历史</button>
+          <button class="secondary" onclick="exportCurrentRun()">导出当前结果</button>
+        </div>
+        <div class="test-status">请先下载统一 `.xlsx` 模板填写用例，再上传并执行。</div>
+
+        <h3>当前运行状态</h3>
+        <div class="test-status" id="testStatus">尚未启动测试。</div>
+
+        <h3>最近运行记录</h3>
+        <div class="runs-list" id="runsList">
+          <div class="run-row"><span style="color:var(--muted)">暂无历史</span><span></span><span></span><span></span><span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ================================================================== //
+//  Known action dictionary (extend as needed)                            //
+// ================================================================== //
+const ACTIONS = {
+  // VIP
+  19600: '领取VIP每日免费宝箱奖励',
+  19601: '领取VIP免费礼包奖励',
+  19602: '购买VIP点数或时间',
+  // Month card
+  19660: 'MonthCardReceiveDailyReward',
+  19661: 'MonthAndWeekCardAllReward',
+  // Week card
+  19650: 'WeekCardSyncInfo',
+  19651: 'WeekCardReceiveFreeBox',
+  19652: 'WeekCardReceiveDailyReward',
+  19653: 'WeekCardSyncItems',
+  19654: 'WeekCardReceiveAllReward',
+  // Mail
+  50001: 'RewardMail',
+  50002: 'DeleteMails',
+  50005: 'CollectMail',
+  50006: 'SyncMailInfo',
+  // Common
+  0: 'VoidResponse',
+  1: 'Sync',
+  209: 'CamelPaymentReceipt',
+  301: 'CrossForward',
+  902: 'TestCmd',
+  3000: 'ChatSend',
+  3001: 'ChatOpen',
+  10042: 'MapTcpLogin',
+  10043: 'MapTcpRelogin',
+  20000: 'SyncMapData',
+};
+
+// ================================================================== //
+//  Template definitions                                                   //
+// ================================================================== //
+const TEMPLATES = [
+  { action: 19660, name: 'Month Card Daily Reward', params: {} },
+  { action: 19661, name: 'Month+Week Card Claim All', params: { activityId: 0 } },
+  { action: 19650, name: 'Week Card Sync', params: { activityId: 0 } },
+  { action: 19651, name: 'Week Card Free Box', params: { activityId: 0 } },
+  { action: 19652, name: 'Week Card Daily Reward', params: { activityId: 0, cardId: 0 } },
+  { action: 19654, name: 'Week Card Claim All', params: { activityId: 0 } },
+  { action: 50001, name: 'Mail Claim Reward', params: { mailIdList: [0] } },
+  { action: 50002, name: 'Delete Mails', params: { mails: [0] } },
+  { action: 50005, name: 'Mail Favorite Toggle', params: { mailId: 0 } },
+  { action: 50006, name: 'Sync Mail Info', params: { maxMailId: 0, mailSyncVersion: 0 } },
+];
+
+// ================================================================== //
+//  State                                                                  //
+// ================================================================== //
+let allPackets = [];
+let visiblePackets = [];
+let selectedId = null;
+let currentTab = 'view';
+let currentRunId = null;
+let currentRunData = null;
+let testPollTimer = null;
+
+// ================================================================== //
+//  Initialization                                                         //
+// ================================================================== //
+function init() {
+  buildTemplates();
+  refreshTestRuns();
+  fetchStatus();
+  setInterval(fetchStatus, 3000);
+
+  // Initial load for existing packets.
+  fetch('/api/packets').then(r => r.json()).then(pkts => {
+    pkts.forEach(addPacket);
+  });
+
+  // Live stream via SSE.
+  const es = new EventSource('/api/stream');
+  es.onmessage = e => {
+    addPacket(JSON.parse(e.data));
+  };
+  es.onerror = () => {
+    // Fallback poll after disconnect.
+    setTimeout(() => {
+      const after = allPackets.length ? allPackets[allPackets.length - 1].id : -1;
+      fetch(`/api/packets?after=${after}`).then(r => r.json()).then(pkts => pkts.forEach(addPacket));
+    }, 2000);
+  };
+}
+
+function defaultSuiteObj() {
+  return {
+    name: 'ui_suite',
+    cases: [
+      {
+        name: 'case_1',
+        steps: [
+          {
+            action: 50006,
+            params: { maxMailId: 0, mailSyncVersion: 0 },
+            timeout_ms: 5000,
+            expect: [{ type: 'exists', path: 'commResp', value: true }]
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function initSuiteEditor() {
+  const txt = document.getElementById('inlineSuite');
+  if (!txt.value.trim()) {
+    txt.value = JSON.stringify(defaultSuiteObj(), null, 2);
+  }
+  loadEditorFromInline();
+}
+
+function loadEditorFromInline() {
+  let suite;
+  try {
+    suite = JSON.parse(document.getElementById('inlineSuite').value);
+  } catch (e) {
+    toast('JSON 解析失败: ' + e.message, true);
+    return;
+  }
+  if (!suite.cases && Array.isArray(suite.steps)) {
+    suite = { name: suite.name || 'inline_suite', cases: [{ name: suite.name || 'case_1', steps: suite.steps }] };
+  }
+  if (!Array.isArray(suite.cases)) suite.cases = [];
+  document.getElementById('suiteNameInput').value = suite.name || 'ui_suite';
+  const box = document.getElementById('suiteCases');
+  box.innerHTML = '';
+  suite.cases.forEach(c => box.appendChild(createCaseEl(c)));
+  document.getElementById('useInlineSuite').checked = true;
+}
+
+function createCaseEl(caseData = {}) {
+  const caseEl = document.createElement('div');
+  caseEl.className = 'case-card';
+  caseEl.innerHTML = `
+    <div class="case-head">
+      <label style="color:var(--muted)">Case:</label>
+      <input type="text" class="case-name mono" style="min-width:220px" value="${escapeHtml(caseData.name || 'case_new')}">
+      <button class="secondary add-step-btn">Add Step</button>
+      <button class="danger del-case-btn">Delete Case</button>
+    </div>
+    <div class="steps-box"></div>
+  `;
+  const stepsBox = caseEl.querySelector('.steps-box');
+  (caseData.steps || []).forEach(s => stepsBox.appendChild(createStepEl(s)));
+  if (!stepsBox.children.length) stepsBox.appendChild(createStepEl());
+
+  caseEl.querySelector('.add-step-btn').onclick = () => stepsBox.appendChild(createStepEl());
+  caseEl.querySelector('.del-case-btn').onclick = () => caseEl.remove();
+  return caseEl;
+}
+
+function createStepEl(step = {}) {
+  const stepEl = document.createElement('div');
+  stepEl.className = 'step-card';
+  const action = step.action ?? '';
+  const responseAction = step.response_action ?? '';
+  const timeoutMs = step.timeout_ms ?? 5000;
+  const paramsText = JSON.stringify(step.params || {}, null, 2);
+  stepEl.innerHTML = `
+    <div class="step-head">
+      <label style="color:var(--muted)">Action</label>
+      <input type="number" class="step-action mono" value="${action}" style="width:100px">
+      <label style="color:var(--muted)">RespAction</label>
+      <input type="number" class="step-resp-action mono" value="${responseAction}" style="width:100px" placeholder="default: same as request action">
+      <label style="color:var(--muted)">Timeout(ms)</label>
+      <input type="number" class="step-timeout mono" value="${timeoutMs}" style="width:110px">
+      <button class="secondary add-expect-btn">Add Expect</button>
+      <button class="danger del-step-btn">Delete Step</button>
+    </div>
+    <div>
+      <label style="color:var(--muted)">Params (JSON)</label>
+      <textarea class="step-params mono" rows="4">${escapeHtml(paramsText)}</textarea>
+    </div>
+    <div class="expects-box"></div>
+  `;
+  const expectsBox = stepEl.querySelector('.expects-box');
+  (step.expect || []).forEach(ex => expectsBox.appendChild(createExpectEl(ex)));
+  if (!expectsBox.children.length) expectsBox.appendChild(createExpectEl({ type: 'exists', path: 'commResp', value: true }));
+
+  stepEl.querySelector('.add-expect-btn').onclick = () => expectsBox.appendChild(createExpectEl());
+  stepEl.querySelector('.del-step-btn').onclick = () => stepEl.remove();
+  return stepEl;
+}
+
+function createExpectEl(exp = {}) {
+  const exEl = document.createElement('div');
+  exEl.className = 'expect-row';
+  const type = exp.type || 'exists';
+  const path = exp.path || '';
+  const valueText = exp.value === undefined ? '' : JSON.stringify(exp.value);
+  exEl.innerHTML = `
+    <select class="expect-type mono">
+      <option value="exists"${type === 'exists' ? ' selected' : ''}>exists</option>
+      <option value="equals"${type === 'equals' ? ' selected' : ''}>equals</option>
+      <option value="contains"${type === 'contains' ? ' selected' : ''}>contains</option>
+    </select>
+    <input type="text" class="expect-path mono" value="${escapeHtml(path)}" placeholder="commResp.code">
+    <input type="text" class="expect-value mono" value="${escapeHtml(valueText)}" placeholder='true / 0 / "ok" / {"k":1}'>
+    <button class="danger del-expect-btn">Delete</button>
+  `;
+  exEl.querySelector('.del-expect-btn').onclick = () => exEl.remove();
+  return exEl;
+}
+
+function addCaseUI() {
+  document.getElementById('suiteCases').appendChild(createCaseEl());
+  document.getElementById('useInlineSuite').checked = true;
+}
+
+function syncEditorToInline() {
+  let suite;
+  try {
+    suite = collectSuiteFromEditor();
+  } catch (e) {
+    toast(e.message || String(e), true);
+    return;
+  }
+  document.getElementById('inlineSuite').value = JSON.stringify(suite, null, 2);
+  document.getElementById('useInlineSuite').checked = true;
+  toast('已从编辑器生成 JSON。');
+}
+
+function collectSuiteFromEditor() {
+  const suiteName = document.getElementById('suiteNameInput').value.trim() || 'ui_suite';
+  const caseEls = [...document.querySelectorAll('#suiteCases .case-card')];
+  if (!caseEls.length) {
+    throw new Error('请至少添加一个 Case。');
+  }
+  const cases = caseEls.map((caseEl, ci) => {
+    const caseName = caseEl.querySelector('.case-name').value.trim() || `case_${ci + 1}`;
+    const stepEls = [...caseEl.querySelectorAll('.step-card')];
+    if (!stepEls.length) throw new Error(`Case[${ci + 1}] has no step.`);
+    const steps = stepEls.map((stepEl, si) => {
+      const actionRaw = stepEl.querySelector('.step-action').value;
+      const action = parseInt(actionRaw, 10);
+      if (!action) throw new Error(`Case[${ci + 1}] Step[${si + 1}] action is invalid.`);
+
+      const respRaw = stepEl.querySelector('.step-resp-action').value.trim();
+      const timeoutRaw = stepEl.querySelector('.step-timeout').value;
+      const timeoutMs = parseInt(timeoutRaw || '5000', 10);
+      if (!timeoutMs || timeoutMs < 1) throw new Error(`Case[${ci + 1}] Step[${si + 1}] timeout_ms is invalid.`);
+
+      const paramsText = stepEl.querySelector('.step-params').value.trim();
+      let params = {};
+      if (paramsText) {
+        try { params = JSON.parse(paramsText); }
+        catch (e) { throw new Error(`Case[${ci + 1}] Step[${si + 1}] params JSON invalid: ${e.message}`); }
+      }
+      const expectEls = [...stepEl.querySelectorAll('.expect-row')];
+      const expect = expectEls.map((exEl, ei) => {
+        const type = exEl.querySelector('.expect-type').value;
+        const path = exEl.querySelector('.expect-path').value.trim();
+        const valText = exEl.querySelector('.expect-value').value.trim();
+        let value;
+        if (!valText && type === 'exists') {
+          value = true;
+        } else if (!valText) {
+          value = '';
+        } else {
+          try { value = JSON.parse(valText); }
+          catch (_) { value = valText; }
+        }
+        return { type, path, value };
+      });
+      const step = { action, params, timeout_ms: timeoutMs, expect };
+      if (respRaw) step.response_action = parseInt(respRaw, 10);
+      return step;
+    });
+    return { name: caseName, steps };
+  });
+  return { name: suiteName, cases };
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function downloadSuiteTemplate() {
+  window.location.href = '/api/test/template.xlsx';
+}
+
+function startTestRun() {
+  const conn = parseInt(document.getElementById('testConn').value) || 0;
+  const suiteFile = document.getElementById('suiteXlsxFile').files[0];
+  if (!suiteFile) {
+    toast('请先上传 .xlsx 测试用例。', true);
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('file', suiteFile);
+  fd.append('conn', String(conn));
+  fetch('/api/test/upload-run', {
+    method: 'POST',
+    body: fd
+  }).then(r => r.json()).then(res => {
+    if (!res.ok) {
+      toast('启动失败: ' + (res.error || 'unknown'), true);
+      return;
+    }
+    currentRunId = res.run.run_id;
+    toast(`已启动运行: ${currentRunId}`);
+    renderRunStatus(res.run);
+    refreshTestRuns();
+    startRunPolling();
+  }).catch(e => toast('启动失败: ' + e.message, true));
+}
+
+function stopTestRun() {
+  if (!currentRunId) {
+    toast('当前没有运行任务。', true);
+    return;
+  }
+  fetch(`/api/test/stop/${currentRunId}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(res => {
+      if (res.ok) {
+        toast('已发送停止请求。');
+        renderRunStatus(res.run);
+      } else {
+        toast('停止失败: ' + (res.error || 'unknown'), true);
+      }
+    })
+    .catch(e => toast('停止失败: ' + e.message, true));
+}
+
+function startRunPolling() {
+  if (testPollTimer) clearInterval(testPollTimer);
+  testPollTimer = setInterval(() => {
+    if (!currentRunId) return;
+    fetch(`/api/test/run/${currentRunId}`).then(r => r.json()).then(run => {
+      renderRunStatus(run);
+      if (run.status !== 'running') {
+        clearInterval(testPollTimer);
+        testPollTimer = null;
+        refreshTestRuns();
+      }
+    }).catch(() => {});
+  }, 1000);
+}
+
+function refreshTestRuns() {
+  fetch('/api/test/runs').then(r => r.json()).then(runs => {
+    const box = document.getElementById('runsList');
+    if (!runs.length) {
+      box.innerHTML = '<div class="run-row"><span style="color:var(--muted)">暂无历史</span><span></span><span></span><span></span><span></span></div>';
+      return;
+    }
+    box.innerHTML = '';
+    runs.forEach(run => {
+      const row = document.createElement('div');
+      row.className = 'run-row';
+      const ended = run.ended_at ? new Date(run.ended_at * 1000).toLocaleTimeString() : '-';
+      row.innerHTML = `
+        <span><b>${run.run_id}</b> ${run.suite_name || run.suite_path || '-'}</span>
+        <span>${run.status}</span>
+        <span>${run.progress.completed_cases || 0}/${run.progress.total_cases || 0}</span>
+        <span>${run.progress.completed_steps || 0}/${run.progress.total_steps || 0}</span>
+        <span>${ended}</span>
+      `;
+      row.querySelector('b').onclick = () => {
+        currentRunId = run.run_id;
+        fetch(`/api/test/run/${run.run_id}`).then(r => r.json()).then(renderRunStatus);
+      };
+      box.appendChild(row);
+    });
+  }).catch(e => toast('刷新历史失败: ' + e.message, true));
+}
+
+function renderRunStatus(run) {
+  currentRunData = run;
+  const p = run.progress || {};
+  const result = run.result || {};
+  const lines = [];
+  lines.push(`run_id: ${run.run_id}`);
+  lines.push(`状态: ${run.status}`);
+  lines.push(`套件: ${run.suite_name || run.suite_path || '-'}`);
+  lines.push(`Case 进度: ${p.completed_cases || 0}/${p.total_cases || 0}`);
+  lines.push(`Step 进度: ${p.completed_steps || 0}/${p.total_steps || 0}`);
+  lines.push(`当前 Case: ${p.current_case || '-'}`);
+  if (run.error) lines.push(`错误: ${run.error}`);
+  if (result.suite_status) {
+    lines.push(`结果: ${result.suite_status}`);
+    lines.push(`通过 Case: ${result.passed_cases}/${result.total_cases}`);
+    lines.push(`通过 Step: ${result.passed_steps}/${result.total_steps}`);
+  }
+  if (run.report_path) lines.push(`报告: ${run.report_path}`);
+  document.getElementById('testStatus').textContent = lines.join('\n');
+}
+
+function exportCurrentRun() {
+  if (!currentRunData || !currentRunData.result) {
+    toast('当前没有可导出的结果。', true);
+    return;
+  }
+  const run = currentRunData;
+  const data = JSON.stringify(run.result, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `test_run_${run.run_id}.json`;
+  a.click();
+}
+
+function buildTemplates() {
+  const grid = document.getElementById('templateGrid');
+  TEMPLATES.forEach(t => {
+    const btn = document.createElement('button');
+    btn.className = 'tpl-btn';
+    btn.innerHTML = `<span class="tpl-action">${t.action}</span>${t.name}<br><span class="tpl-name">${ACTIONS[t.action] || ''}</span>`;
+    btn.onclick = () => {
+      document.getElementById('sendAction').value = t.action;
+      document.getElementById('sendParams').value = JSON.stringify(t.params, null, 2);
+      switchTab('send');
+    };
+    grid.appendChild(btn);
+  });
+}
+
+// ================================================================== //
+//  Packet handling                                                        //
+// ================================================================== //
+function addPacket(pkt) {
+  allPackets.push(pkt);
+  document.getElementById('pktCount').textContent = allPackets.length;
+
+  if (matchesFilter(pkt)) {
+    visiblePackets.push(pkt);
+    renderRow(pkt);
+    if (document.getElementById('autoScroll').checked) {
+      const list = document.getElementById('pktList');
+      list.scrollTop = list.scrollHeight;
+    }
+  }
+}
+
+function matchesFilter(pkt) {
+  const af = document.getElementById('filterAction').value.trim();
+  const df = document.getElementById('filterDir').value;
+  const sf = document.getElementById('searchBox').value.trim().toLowerCase();
+
+  if (af && String(pkt.action) !== af) return false;
+  if (df && pkt.direction !== df) return false;
+  if (sf) {
+    const str = JSON.stringify(pkt.decoded).toLowerCase();
+    if (!str.includes(sf)) return false;
+  }
+  return true;
+}
+
+function renderRow(pkt) {
+  const list = document.getElementById('pktList');
+  if (list.querySelector('.empty-hint')) list.innerHTML = '';
+
+  const row = document.createElement('div');
+  row.className = 'pkt-row' + (pkt.id === selectedId ? ' selected' : '');
+  row.id = `row-${pkt.id}`;
+  row.onclick = () => selectPacket(pkt.id);
+
+  const ts = new Date(pkt.timestamp * 1000);
+  const timeStr = ts.toTimeString().slice(0, 8);
+  const actionName = ACTIONS[pkt.action] || '';
+
+  row.innerHTML = `
+    <span class="pkt-id">${pkt.id}</span>
+    <span class="dir-badge dir-${pkt.direction.toLowerCase()}">${pkt.direction}</span>
+    <span class="pkt-action">${pkt.action ?? '-'}</span>
+    <span class="pkt-name" title="${actionName}">${actionName}${pkt.note ? `<span class="pkt-note">*</span>` : ''}</span>
+    <span class="pkt-time">${timeStr}</span>
+  `;
+  list.appendChild(row);
+}
+
+function applyFilter() {
+  visiblePackets = allPackets.filter(matchesFilter);
+  const list = document.getElementById('pktList');
+  list.innerHTML = visiblePackets.length ? '' : '<div class="empty-hint">无匹配数据包</div>';
+  visiblePackets.forEach(renderRow);
+}
+
+// ================================================================== //
+//  Selection & details                                                    //
+// ================================================================== //
+function selectPacket(id) {
+  selectedId = id;
+  document.querySelectorAll('.pkt-row').forEach(r => r.classList.remove('selected'));
+  const row = document.getElementById(`row-${id}`);
+  if (row) row.classList.add('selected');
+
+  // Get packet detail (includes full hex).
+  fetch(`/api/packets/${id}`).then(r => r.json()).then(pkt => {
+    renderDetail(pkt);
+    populateEditor(pkt);
+    renderHex(pkt);
+  });
+}
+
+function renderDetail(pkt) {
+  const actionName = ACTIONS[pkt.action] || '';
+  const ts = new Date(pkt.timestamp * 1000).toLocaleString();
+  document.getElementById('detailHeader').innerHTML = `
+    <div class="detail-meta">
+      <span class="kv"><span>#</span>${pkt.id}</span>
+      <span class="dir-badge dir-${pkt.direction.toLowerCase()}">${pkt.direction}</span>
+      <span class="kv"><span>Action </span><b style="color:var(--yellow)">${pkt.action ?? '-'}</b></span>
+      <span class="kv" style="color:var(--accent)">${actionName}</span>
+      <span class="kv"><span>${ts}</span></span>
+    </div>
+    <button class="secondary" style="margin-left:auto" onclick="promptNote(${pkt.id})">备注</button>
+    <button onclick="loadReplay(${pkt.id})" title="切换到编辑页">编辑重放</button>
+  `;
+  document.getElementById('jsonView').innerHTML = syntaxHighlight(pkt.decoded);
+}
+
+function syntaxHighlight(obj) {
+  const str = JSON.stringify(obj, null, 2);
+  return str.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, match => {
+    let cls = 'json-num';
+    if (/^"/.test(match)) {
+      cls = /:$/.test(match) ? 'json-key' : 'json-str';
+    } else if (/true|false/.test(match)) {
+      cls = 'json-bool';
+    } else if (/null/.test(match)) {
+      cls = 'json-null';
+    }
+    return `<span class="${cls}">${match}</span>`;
+  });
+}
+
+function renderHex(pkt) {
+  const hex = pkt.raw_hex || '';
+  let out = '';
+  for (let i = 0; i < hex.length; i += 2) {
+    out += hex.slice(i, i+2) + ' ';
+    if ((i / 2 + 1) % 16 === 0) out += '\n';
+  }
+  document.getElementById('hexView').textContent = out;
+}
+
+// ================================================================== //
+//  Edit / replay                                                          //
+// ================================================================== //
+function populateEditor(pkt) {
+  const copy = Object.assign({}, pkt.decoded);
+  // commReq is re-generated during send.
+  delete copy.commReq;
+  document.getElementById('editArea').value = JSON.stringify(copy, null, 2);
+}
+
+function loadReplay(id) {
+  fetch(`/api/packets/${id}`).then(r => r.json()).then(pkt => {
+    populateEditor(pkt);
+    switchTab('edit');
+  });
+}
+
+function replayEdited() {
+  let msg;
+  try { msg = JSON.parse(document.getElementById('editArea').value); }
+  catch (e) { toast('JSON 格式错误: ' + e.message, true); return; }
+
+  if (!msg.action) { toast('缺少 action 字段。', true); return; }
+  const conn = parseInt(document.getElementById('replayConn').value) || 0;
+
+  const pid = selectedId;
+  const selected = allPackets.find(p => p.id === pid);
+  if (selected && selected.direction === 'C2S') {
+    fetch(`/api/replay/${pid}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conn, overrides: msg })
+    }).then(r => r.json()).then(res => {
+      if (res.ok) toast(`已重放 (msgId=${res.msg_id ?? '-'})`);
+      else toast('失败: ' + res.error, true);
+    });
+    return;
+  }
+
+  const action = parseInt(msg.action);
+  const params = Object.assign({}, msg);
+  delete params.action;
+  fetch('/api/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, params, conn })
+  }).then(r => r.json()).then(res => {
+    if (res.ok) toast(`已发送 (msgId=${res.msg_id ?? '-'})`);
+    else toast('失败: ' + res.error, true);
+  });
+}
+
+function formatEditor() {
+  try {
+    const obj = JSON.parse(document.getElementById('editArea').value);
+    document.getElementById('editArea').value = JSON.stringify(obj, null, 2);
+  } catch (e) {
+    toast('JSON 格式错误', true);
+  }
+}
+
+// ================================================================== //
+//  Custom send                                                            //
+// ================================================================== //
+function sendCustom() {
+  const action = parseInt(document.getElementById('sendAction').value);
+  if (!action) { toast('请填写 Action。', true); return; }
+
+  let params = {};
+  const raw = document.getElementById('sendParams').value.trim();
+  if (raw) {
+    try { params = JSON.parse(raw); }
+    catch (e) { toast('参数 JSON 格式错误: ' + e.message, true); return; }
+  }
+  const conn = parseInt(document.getElementById('sendConn').value) || 0;
+
+  fetch('/api/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, params, conn })
+  }).then(r => r.json()).then(res => {
+    if (res.ok) {
+      toast(`已发送 (msgId=${res.msg_id})`);
+      document.getElementById('sendResult').textContent = `发送成功，消息 ID: ${res.msg_id}`;
+    } else {
+      toast('失败: ' + res.error, true);
+      document.getElementById('sendResult').textContent = '错误: ' + res.error;
+    }
+  });
+}
+
+// ================================================================== //
+//  Misc actions                                                           //
+// ================================================================== //
+function clearAll() {
+  if (!confirm('确定清空所有已捕获的数据包吗？')) return;
+  fetch('/api/clear', { method: 'POST' }).then(() => {
+    allPackets = [];
+    visiblePackets = [];
+    selectedId = null;
+    document.getElementById('pktList').innerHTML = '<div class="empty-hint">等待数据包...</div>';
+    document.getElementById('jsonView').innerHTML = '';
+    document.getElementById('hexView').textContent = '选择数据包后显示原始 HEX...';
+    document.getElementById('pktCount').textContent = '0';
+  });
+}
+
+function setToken() {
+  const token = document.getElementById('tokenInput').value.trim();
+  fetch('/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token })
+  }).then(() => {
+    document.getElementById('tokenDisp').textContent = token.slice(0, 12) + '...';
+    toast('Token 已设置。');
+  });
+}
+
+function promptNote(id) {
+  const note = prompt('为此数据包添加备注:');
+  if (note === null) return;
+  fetch(`/api/packets/${id}/note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note })
+  }).then(() => {
+    const pkt = allPackets.find(p => p.id === id);
+    if (pkt) pkt.note = note;
+    applyFilter();
+    toast('备注已保存。');
+  });
+}
+
+function exportJSON() {
+  const data = JSON.stringify(visiblePackets, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `packets_${Date.now()}.json`;
+  a.click();
+}
+
+function fetchStatus() {
+  fetch('/api/status').then(r => r.json()).then(s => {
+    document.getElementById('connCount').textContent = s.active_connections;
+    if (s.token) document.getElementById('tokenDisp').textContent = String(s.token).slice(0, 12) + '...';
+    renderSetupGuide(s.local_ip, s.http_port, s.active_connections);
+  });
+}
+
+function renderSetupGuide(localIp, httpPort, connCount) {
+  const el = document.getElementById('setupGuide');
+  if (connCount > 0) {
+    el.innerHTML = `<div class="setup-card"><h4>已连接: ${connCount} 条活跃连接</h4></div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="setup-card">
+      <h4>手机代理配置（仅需一次）</h4>
+      <div class="setup-steps">
+        <div class="setup-step"><div class="step-num">1</div><div class="step-txt">手机与电脑连接到<b>同一 Wi-Fi</b>。</div></div>
+        <div class="setup-step"><div class="step-num">2</div><div class="step-txt">手机 Wi-Fi 代理改为<b>手动</b><br>主机: <b>${localIp}</b> 端口: <b>${httpPort}</b></div></div>
+        <div class="setup-step"><div class="step-num">3</div><div class="step-txt">重启游戏，SSO 请求会自动被拦截。</div></div>
+      </div>
+    </div>`;
+}
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab-btn').forEach((b, i) => {
+    const tabs = ['view', 'edit', 'hex', 'send', 'test'];
+    b.classList.toggle('active', tabs[i] === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(el => {
+    el.classList.toggle('active', el.id === `tab-${name}`);
+  });
+}
+
+let _toastTimer;
+function toast(msg, err = false) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (err ? ' err' : '');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.remove(), 2500);
+}
+
+init();
+</script>
+</body>
+</html>

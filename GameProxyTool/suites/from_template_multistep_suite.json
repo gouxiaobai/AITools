@@ -1,0 +1,76 @@
+{
+  "name": "multi_step_regression_suite",
+  "cases": [
+    {
+      "name": "month_card_full_flow",
+      "steps": [
+        {
+          "action": 19660,
+          "params": {},
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            },
+            {
+              "type": "equals",
+              "path": "commResp.code",
+              "value": 0
+            }
+          ],
+          "response_action": 19660
+        },
+        {
+          "action": 19661,
+          "params": {
+            "activityId": 0
+          },
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            }
+          ],
+          "response_action": 19661
+        }
+      ]
+    },
+    {
+      "name": "week_card_then_sync_mail",
+      "steps": [
+        {
+          "action": 19650,
+          "params": {
+            "activityId": 0
+          },
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "equals",
+              "path": "commResp.code",
+              "value": 0
+            }
+          ],
+          "response_action": 19650
+        },
+        {
+          "action": 50006,
+          "params": {
+            "maxMailId": 0,
+            "mailSyncVersion": 0
+          },
+          "timeout_ms": 5000,
+          "expect": [
+            {
+              "type": "exists",
+              "path": "commResp"
+            }
+          ],
+          "response_action": 50006
+        }
+      ]
+    }
+  ]
+}
