@@ -100,27 +100,353 @@ def _render_sync_result(parsed: Optional[Any], raw: str) -> None:
 
 
 def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
+    rec_list: List[Dict[str, Any]] = []
+    account_summary: Dict[str, Any] = {}
     if isinstance(parsed, list):
-        df = _as_df(parsed)
+        rec_list = parsed
+    elif isinstance(parsed, dict):
+        if isinstance(parsed.get("recommendations"), list):
+            rec_list = parsed.get("recommendations", [])
+        if isinstance(parsed.get("account_summary"), dict):
+            account_summary = parsed.get("account_summary", {})
+
+    if account_summary:
+        st.subheader("账户总览")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("建议总数", len(df))
-        c2.metric("BUY", int((df.get("action", pd.Series()) == "BUY").sum()) if "action" in df else 0)
-        c3.metric("SELL", int((df.get("action", pd.Series()) == "SELL").sum()) if "action" in df else 0)
-        c4.metric("HOLD", int((df.get("action", pd.Series()) == "HOLD").sum()) if "action" in df else 0)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        c1.metric("总资产", f"{float(account_summary.get('total_asset', 0.0)):.2f}")
+        c2.metric("总盈亏", f"{float(account_summary.get('total_pnl', 0.0)):.2f}")
+        c3.metric("已实现盈亏", f"{float(account_summary.get('realized_pnl_total', 0.0)):.2f}")
+        c4.metric("未实现盈亏", f"{float(account_summary.get('unrealized_pnl_total', 0.0)):.2f}")
+        c5, c6, c7 = st.columns(3)
+        c5.metric("可流动现金", f"{float(account_summary.get('cash', 0.0)):.2f}")
+        c6.metric("持仓成本", f"{float(account_summary.get('invested_cost_total', 0.0)):.2f}")
+        c7.metric("持仓市值", f"{float(account_summary.get('market_value_total', 0.0)):.2f}")
+        c8, c9 = st.columns(2)
+        c8.metric("已定价持仓数", int(float(account_summary.get("priced_positions", 0.0))))
+        c9.metric("未定价持仓数", int(float(account_summary.get("unpriced_positions", 0.0))))
+        st.caption("建议股数换算基准：总资产（可流动现金 + 持仓市值）；现金来自独立现金库 DB_CASH_CONFIG_ID。")
+        reconcile = account_summary.get("reconcile", {})
+        if isinstance(reconcile, dict) and reconcile.get("has_reference", False):
+            if bool(reconcile.get("ok", True)):
+                st.success(
+                    f"Notion公式对账通过（最大偏差 {float(reconcile.get('max_delta', 0.0)):.2f}，阈值 {float(reconcile.get('threshold', 0.0)):.2f}）"
+                )
+            else:
+                st.warning(
+                    f"Notion公式对账偏差超阈值（最大偏差 {float(reconcile.get('max_delta', 0.0)):.2f}，阈值 {float(reconcile.get('threshold', 0.0)):.2f}）"
+                )
+            checks = reconcile.get("checks", [])
+            if isinstance(checks, list) and checks:
+                ck_df = pd.DataFrame(checks)
+                if not ck_df.empty:
+                    ck_df = ck_df.rename(columns={"key": "指标", "code": "代码值", "notion": "Notion值", "delta": "偏差"})
+                    st.dataframe(
+                        ck_df.style.format({"代码值": "{:.2f}", "Notion值": "{:.2f}", "偏差": "{:.2f}"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+    if rec_list:
+        df = pd.DataFrame(rec_list)
+        for col in ["action", "confidence", "strategy_id", "stock_name", "stock_code", "reason", "mode"]:
+            if col not in df.columns:
+                df[col] = ""
+        for col in [
+            "buy_price",
+            "sell_price",
+            "stop_price",
+            "sample_count",
+            "suggest_buy_shares",
+            "suggest_sell_shares",
+            "estimated_trade_value",
+            "holding_shares_now",
+            "market_value_now",
+            "unrealized_pnl_now",
+        ]:
+            if col not in df.columns:
+                df[col] = None
+
+        df["action"] = df["action"].astype(str).str.upper()
+        df["confidence"] = df["confidence"].astype(str).str.upper()
+        df["strategy_id"] = df["strategy_id"].astype(str).str.upper()
+        df["stock_name"] = df["stock_name"].astype(str)
+        df["stock_code"] = df["stock_code"].astype(str)
+        df["stock_key"] = (df["stock_name"].str.strip() + " (" + df["stock_code"].str.strip() + ")").str.strip()
+        df["is_executable"] = (
+            df["action"].isin(["BUY", "SELL"])
+            & df["buy_price"].notna()
+            & df["sell_price"].notna()
+            & df["stop_price"].notna()
+        )
+
+        action_rank = {"BUY": 0, "SELL": 1, "HOLD": 2}
+        conf_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        df["action_rank"] = df["action"].map(action_rank).fillna(9)
+        df["conf_rank"] = df["confidence"].map(conf_rank).fillna(9)
+        df["sample_sort"] = pd.to_numeric(df["sample_count"], errors="coerce").fillna(0)
+        df = df.sort_values(by=["action_rank", "conf_rank", "sample_sort"], ascending=[True, True, False])
+
+        st.subheader("建议筛选")
+        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.8, 1.2])
+        action_filter = f1.multiselect("动作", options=["BUY", "SELL", "HOLD"], default=["BUY", "SELL", "HOLD"], key="rec_action_filter")
+        conf_filter = f2.multiselect("置信度", options=["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"], key="rec_conf_filter")
+        keyword = f3.text_input("关键词（股票名/代码）", value="", key="rec_keyword").strip().lower()
+        only_exec = f4.checkbox("仅看可执行建议", value=False, key="rec_only_exec")
+        show_all_strategies = st.checkbox("展开全部策略（默认仅显示 BASELINE）", value=False, key="rec_show_all_strategy")
+
+        fdf = df[df["action"].isin(action_filter) & df["confidence"].isin(conf_filter)].copy()
+        if keyword:
+            fdf = fdf[
+                fdf["stock_name"].str.lower().str.contains(keyword, na=False)
+                | fdf["stock_code"].str.lower().str.contains(keyword, na=False)
+            ]
+        if only_exec:
+            fdf = fdf[fdf["is_executable"]]
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("建议总数", int(len(fdf)))
+        c2.metric("BUY", int((fdf["action"] == "BUY").sum()))
+        c3.metric("SELL", int((fdf["action"] == "SELL").sum()))
+        c4.metric("HOLD", int((fdf["action"] == "HOLD").sum()))
+        c5.metric("高优先机会", int((fdf["action"].isin(["BUY", "SELL"]) & fdf["confidence"].isin(["HIGH", "MEDIUM"])).sum()))
+
+        st.caption("操作提示：BUY 可考虑分批建仓；SELL 可考虑减仓/止盈；HOLD 等待触发区间。")
+
+        if fdf.empty:
+            st.info("当前筛选条件下没有建议结果。")
+            _show_json_debug("交易建议结果", raw)
+            return
+
+        st.subheader("决策卡片墙")
+        grouped = list(fdf.groupby("stock_key", sort=False))
+        for idx, (stock_key, g) in enumerate(grouped):
+            g = g.copy()
+            g = g.sort_values(by=["strategy_id"], ascending=[True])
+            baseline = g[g["strategy_id"] == "BASELINE"]
+            primary = baseline.iloc[0] if not baseline.empty else g.iloc[0]
+            show_rows = g if show_all_strategies else pd.DataFrame([primary])
+
+            with st.container(border=True):
+                a = str(primary.get("action", "")).upper()
+                if a == "BUY":
+                    action_text = f":green[{a}]"
+                elif a == "SELL":
+                    action_text = f":red[{a}]"
+                else:
+                    action_text = f":gray[{a}]"
+                st.markdown(f"**{stock_key}**  ·  动作 {action_text}  ·  置信度 `{str(primary.get('confidence', ''))}`")
+
+                for _, row in show_rows.iterrows():
+                    strategy = str(row.get("strategy_id", ""))
+                    buy = row.get("buy_price")
+                    sell = row.get("sell_price")
+                    stop = row.get("stop_price")
+                    buy_shares = int(float(row.get("suggest_buy_shares", 0) or 0))
+                    sell_shares = int(float(row.get("suggest_sell_shares", 0) or 0))
+                    trade_value = float(row.get("estimated_trade_value", 0.0) or 0.0)
+                    holding_now = int(float(row.get("holding_shares_now", 0.0) or 0.0))
+                    unrealized_now = float(row.get("unrealized_pnl_now", 0.0) or 0.0)
+                    market_now = float(row.get("market_value_now", 0.0) or 0.0)
+                    c_buy, c_sell, c_stop, c_meta = st.columns([1, 1, 1, 1.5])
+                    c_buy.metric(f"{strategy} 买入价", f"{float(buy):.4f}" if pd.notna(buy) else "N/A")
+                    c_sell.metric(f"{strategy} 卖出价", f"{float(sell):.4f}" if pd.notna(sell) else "N/A")
+                    c_stop.metric(f"{strategy} 止损价", f"{float(stop):.4f}" if pd.notna(stop) else "N/A")
+                    c_meta.metric(f"{strategy} 样本数", int(float(row.get("sample_count", 0) or 0)))
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric(f"{strategy} 建议买入股数", buy_shares)
+                    m2.metric(f"{strategy} 建议卖出股数", sell_shares)
+                    m3.metric(f"{strategy} 当前持仓股数", holding_now)
+                    m4, m5 = st.columns(2)
+                    m4.metric(f"{strategy} 当前持仓市值", f"{market_now:.2f}")
+                    m5.metric(f"{strategy} 当前浮动盈亏", f"{unrealized_now:.2f}")
+                    st.caption(f"{strategy} 预计成交金额: {trade_value:.2f}")
+                    reason = str(row.get("reason", "")).strip()
+                    mode = str(row.get("mode", "")).strip()
+                    size_note = str(row.get("sizing_note", "")).strip()
+                    note = f"模式: {mode or '-'}；理由: {reason or '-'}"
+                    st.caption(note)
+                    if size_note:
+                        st.caption(f"股数换算: {size_note}")
+                    if not (pd.notna(buy) and pd.notna(sell) and pd.notna(stop)):
+                        st.warning(f"{strategy} 缺少价格字段（买入/卖出/止损）中的至少一项，谨慎执行。")
+
+                if not show_all_strategies and len(g) > 1:
+                    with st.expander(f"查看 {stock_key} 全部策略（{len(g)} 条）", expanded=False):
+                        view = g[
+                            [
+                                "strategy_id",
+                                "action",
+                                "buy_price",
+                                "sell_price",
+                                "stop_price",
+                                "suggest_buy_shares",
+                                "suggest_sell_shares",
+                                "holding_shares_now",
+                                "estimated_trade_value",
+                                "market_value_now",
+                                "unrealized_pnl_now",
+                                "confidence",
+                                "mode",
+                                "sample_count",
+                                "reason",
+                            ]
+                        ]
+                        st.dataframe(view, use_container_width=True, hide_index=True)
+
+            if idx < len(grouped) - 1:
+                st.markdown("")
+
+        st.subheader("建议明细表")
+        detail = fdf[
+            [
+                "stock_name",
+                "stock_code",
+                "strategy_id",
+                "action",
+                "buy_price",
+                "sell_price",
+                "stop_price",
+                "suggest_buy_shares",
+                "suggest_sell_shares",
+                "holding_shares_now",
+                "estimated_trade_value",
+                "market_value_now",
+                "unrealized_pnl_now",
+                "confidence",
+                "sample_count",
+                "mode",
+                "reason",
+                "is_executable",
+            ]
+        ].copy()
+        detail = detail.rename(
+            columns={
+                "stock_name": "股票",
+                "stock_code": "代码",
+                "strategy_id": "策略",
+                "action": "动作",
+                "buy_price": "买入价",
+                "sell_price": "卖出价",
+                "stop_price": "止损价",
+                "suggest_buy_shares": "建议买入股数",
+                "suggest_sell_shares": "建议卖出股数",
+                "holding_shares_now": "当前持仓股数",
+                "estimated_trade_value": "预计成交金额",
+                "market_value_now": "当前持仓市值",
+                "unrealized_pnl_now": "当前浮动盈亏",
+                "confidence": "置信度",
+                "sample_count": "样本数",
+                "mode": "模式",
+                "reason": "理由",
+                "is_executable": "可执行",
+            }
+        )
+        st.dataframe(
+            detail.style.format(
+                {
+                    "买入价": "{:.4f}",
+                    "卖出价": "{:.4f}",
+                    "止损价": "{:.4f}",
+                    "预计成交金额": "{:.2f}",
+                    "当前持仓市值": "{:.2f}",
+                    "当前浮动盈亏": "{:.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    elif isinstance(parsed, list) or isinstance(parsed, dict):
+        st.info("建议结果为空，请先确认股票池与数据源是否可用。")
     _show_json_debug("交易建议结果", raw)
 
 
 def _render_backtest_result(parsed: Optional[Any], raw: str) -> None:
     if isinstance(parsed, dict):
         baseline = parsed.get("baseline", {}) if isinstance(parsed.get("baseline"), dict) else {}
-        strategy = parsed.get("strategy_all", {}) if isinstance(parsed.get("strategy_all"), dict) else {}
+        strategy_all = parsed.get("strategy_all", {}) if isinstance(parsed.get("strategy_all"), dict) else {}
+        strategy_metrics = parsed.get("strategy_metrics", {}) if isinstance(parsed.get("strategy_metrics"), dict) else {}
+        strategy_by_mode = parsed.get("strategy_by_mode", {}) if isinstance(parsed.get("strategy_by_mode"), dict) else {}
+        source = str(parsed.get("data_source", "unknown")).upper()
+
+        st.caption(f"数据源: `{source}`")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("基线 Sharpe-like", f"{baseline.get('sharpe_like', 0):.4f}")
-        c2.metric("策略 Sharpe-like", f"{strategy.get('sharpe_like', 0):.4f}")
-        c3.metric("基线回撤", f"{baseline.get('max_drawdown', 0):.4f}")
-        c4.metric("策略回撤", f"{strategy.get('max_drawdown', 0):.4f}")
-        st.dataframe(_as_df(parsed.get("strategy_metrics", {})), use_container_width=True)
+        c1.metric("策略 Sharpe-like", f"{float(strategy_all.get('sharpe_like', 0.0)):.4f}", delta=f"{float(strategy_all.get('sharpe_like', 0.0)) - float(baseline.get('sharpe_like', 0.0)):+.4f}")
+        c2.metric("策略均值收益", f"{float(strategy_all.get('mean', 0.0)):.4%}", delta=f"{float(strategy_all.get('mean', 0.0)) - float(baseline.get('mean', 0.0)):+.4%}")
+        c3.metric("策略最大回撤", f"{float(strategy_all.get('max_drawdown', 0.0)):.4%}", delta=f"{float(baseline.get('max_drawdown', 0.0)) - float(strategy_all.get('max_drawdown', 0.0)):+.4%}")
+        c4.metric("样本数", int(float(strategy_all.get("count", 0.0))))
+
+        if strategy_metrics:
+            rows: List[Dict[str, Any]] = []
+            for sid, m in strategy_metrics.items():
+                rows.append(
+                    {
+                        "策略": sid,
+                        "样本数": int(float(m.get("count", 0.0))),
+                        "平均收益": float(m.get("mean", 0.0)),
+                        "波动": float(m.get("vol", 0.0)),
+                        "Sharpe-like": float(m.get("sharpe_like", 0.0)),
+                        "最大回撤": float(m.get("max_drawdown", 0.0)),
+                        "空仓占比": float(m.get("hold_ratio", 0.0)),
+                    }
+                )
+            sdf = pd.DataFrame(rows).sort_values(by="Sharpe-like", ascending=False)
+            top_row = sdf.iloc[0]
+            st.success(f"当前最佳策略: {top_row['策略']}  |  Sharpe-like={top_row['Sharpe-like']:.4f}  |  回撤={top_row['最大回撤']:.4%}")
+
+            st.subheader("策略对比表")
+            st.dataframe(
+                sdf.style.format(
+                    {
+                        "平均收益": "{:.4%}",
+                        "波动": "{:.4%}",
+                        "Sharpe-like": "{:.4f}",
+                        "最大回撤": "{:.4%}",
+                        "空仓占比": "{:.2%}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            c5, c6 = st.columns(2)
+            with c5:
+                st.subheader("Sharpe-like 排行")
+                sharpe_df = sdf[["策略", "Sharpe-like"]].set_index("策略")
+                st.bar_chart(sharpe_df)
+            with c6:
+                st.subheader("收益 vs 回撤")
+                rr_df = sdf[["策略", "平均收益", "最大回撤"]].set_index("策略")
+                st.bar_chart(rr_df)
+
+            st.subheader("空仓占比")
+            hold_df = sdf[["策略", "空仓占比"]].set_index("策略")
+            st.bar_chart(hold_df)
+
+        if strategy_by_mode:
+            mode_rows: List[Dict[str, Any]] = []
+            for mode, m in strategy_by_mode.items():
+                if not isinstance(m, dict):
+                    continue
+                mode_rows.append(
+                    {
+                        "模式": mode,
+                        "样本数": int(float(m.get("count", 0.0))),
+                        "平均收益": float(m.get("mean", 0.0)),
+                        "Sharpe-like": float(m.get("sharpe_like", 0.0)),
+                        "最大回撤": float(m.get("max_drawdown", 0.0)),
+                    }
+                )
+            if mode_rows:
+                mdf = pd.DataFrame(mode_rows).sort_values(by="Sharpe-like", ascending=False)
+                st.subheader("策略模式表现")
+                st.dataframe(
+                    mdf.style.format(
+                        {"平均收益": "{:.4%}", "Sharpe-like": "{:.4f}", "最大回撤": "{:.4%}"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.bar_chart(mdf.set_index("模式")[["Sharpe-like", "平均收益"]])
     _show_json_debug("回测结果", raw)
 
 

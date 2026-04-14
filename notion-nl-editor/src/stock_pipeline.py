@@ -156,6 +156,7 @@ class Cfg:
     buy_wide_id: str
     t_record_id: str
     strategy_snapshot_id: str
+    cash_config_id: str
 
 
 def load_cfg() -> Cfg:
@@ -167,6 +168,7 @@ def load_cfg() -> Cfg:
         buy_wide_id=os.getenv("DB_BUY_WIDE_ID", "0d485b47-e903-4fd3-901e-1bb4d09200f1"),
         t_record_id=os.getenv("DB_T_RECORD_ID", "93dde4b0-5d6f-4c49-a825-e49ae95be420"),
         strategy_snapshot_id=os.getenv("DB_STRATEGY_SNAPSHOT_ID", ""),
+        cash_config_id=os.getenv("DB_CASH_CONFIG_ID", ""),
     )
 
 
@@ -744,6 +746,242 @@ class TradePoint:
     stock_id: str
 
 
+@dataclass
+class KBar:
+    symbol: str
+    trade_date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    vol: float
+    amount: float
+    adj: str
+
+
+class KlineStore:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        _ensure_parent_dir(db_path)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def _init_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kline_daily (
+                symbol TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                vol REAL NOT NULL,
+                amount REAL NOT NULL,
+                adj TEXT NOT NULL,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, trade_date, adj)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kline_sync_log (
+                symbol TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                bars INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(symbol, start_date, end_date)
+            )
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_symbol_date ON kline_daily(symbol, trade_date)")
+        self.conn.commit()
+
+    def upsert_bars(self, bars: List[KBar], source: str) -> int:
+        if not bars:
+            return 0
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO kline_daily(symbol, trade_date, open, high, low, close, vol, amount, adj, source, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date, adj) DO UPDATE SET
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    vol=excluded.vol,
+                    amount=excluded.amount,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                [
+                    (
+                        b.symbol,
+                        b.trade_date,
+                        float(b.open),
+                        float(b.high),
+                        float(b.low),
+                        float(b.close),
+                        float(b.vol),
+                        float(b.amount),
+                        b.adj,
+                        source,
+                        now,
+                    )
+                    for b in bars
+                ],
+            )
+        return len(bars)
+
+    def query_bars(self, symbol: str, start_date: str, end_date: str, adj: str) -> List[KBar]:
+        cur = self.conn.execute(
+            """
+            SELECT symbol, trade_date, open, high, low, close, vol, amount, adj
+            FROM kline_daily
+            WHERE symbol=? AND adj=? AND trade_date>=? AND trade_date<=?
+            ORDER BY trade_date ASC
+            """,
+            (symbol, adj, start_date, end_date),
+        )
+        out: List[KBar] = []
+        for row in cur.fetchall():
+            out.append(
+                KBar(
+                    symbol=str(row["symbol"]),
+                    trade_date=str(row["trade_date"]),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    vol=float(row["vol"]),
+                    amount=float(row["amount"]),
+                    adj=str(row["adj"]),
+                )
+            )
+        return out
+
+    def record_sync(self, symbol: str, start_date: str, end_date: str, bars: int, status: str, error: str = "") -> None:
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO kline_sync_log(symbol, start_date, end_date, bars, status, error, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, start_date, end_date) DO UPDATE SET
+                    bars=excluded.bars,
+                    status=excluded.status,
+                    error=excluded.error,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, start_date, end_date, int(bars), status, error[:500], now),
+            )
+
+
+class KlineProvider:
+    def __init__(self, token: str, store: KlineStore) -> None:
+        self.token = token.strip()
+        self.store = store
+        self.session = requests.Session()
+        self.base = "https://api.waditu.com"
+        if not self.token:
+            raise RuntimeError("Missing TUSHARE_TOKEN for kline mode.")
+
+    def _post(self, api_name: str, params: Dict[str, Any], fields: str) -> List[Dict[str, Any]]:
+        payload = {"api_name": api_name, "token": self.token, "params": params, "fields": fields}
+        resp = self.session.post(self.base, json=payload, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Tushare {api_name} failed: {data.get('msg', 'unknown')}")
+        items = data.get("data", {})
+        fields_arr = items.get("fields", [])
+        rows = items.get("items", [])
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            obj: Dict[str, Any] = {}
+            for i, key in enumerate(fields_arr):
+                obj[str(key)] = row[i] if i < len(row) else None
+            out.append(obj)
+        return out
+
+    def _fetch_daily_raw(self, ts_code: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        return self._post(
+            "daily",
+            {"ts_code": ts_code, "start_date": start_date.replace("-", ""), "end_date": end_date.replace("-", "")},
+            "ts_code,trade_date,open,high,low,close,vol,amount",
+        )
+
+    def _fetch_adj_factor(self, ts_code: str, start_date: str, end_date: str) -> Dict[str, float]:
+        rows = self._post(
+            "adj_factor",
+            {"ts_code": ts_code, "start_date": start_date.replace("-", ""), "end_date": end_date.replace("-", "")},
+            "ts_code,trade_date,adj_factor",
+        )
+        return {str(r.get("trade_date", "")): float(r.get("adj_factor", 0.0) or 0.0) for r in rows}
+
+    def sync_symbol(self, ts_code: str, start_date: str, end_date: str, adj: str, force: bool = False) -> Dict[str, Any]:
+        _ = force
+        daily_rows = self._fetch_daily_raw(ts_code, start_date, end_date)
+        if not daily_rows:
+            self.store.record_sync(ts_code, start_date, end_date, 0, "ok", "")
+            return {"symbol": ts_code, "bars": 0, "status": "ok"}
+        adj_map: Dict[str, float] = {}
+        if adj in {"qfq", "hfq"}:
+            adj_map = self._fetch_adj_factor(ts_code, start_date, end_date)
+        bars: List[KBar] = []
+        base_factor = 0.0
+        if adj_map:
+            factors = [x for x in adj_map.values() if x > 0]
+            if factors:
+                base_factor = max(factors) if adj == "qfq" else min(factors)
+        for row in daily_rows:
+            tdate_raw = str(row.get("trade_date", ""))
+            tdate = f"{tdate_raw[:4]}-{tdate_raw[4:6]}-{tdate_raw[6:8]}" if len(tdate_raw) == 8 else ""
+            o = float(row.get("open", 0.0) or 0.0)
+            h = float(row.get("high", 0.0) or 0.0)
+            l = float(row.get("low", 0.0) or 0.0)
+            c = float(row.get("close", 0.0) or 0.0)
+            if adj_map and base_factor > 0 and tdate_raw in adj_map and adj_map[tdate_raw] > 0:
+                factor = float(adj_map[tdate_raw]) / base_factor
+                o, h, l, c = o * factor, h * factor, l * factor, c * factor
+            if not tdate or c <= 0:
+                continue
+            bars.append(
+                KBar(
+                    symbol=ts_code,
+                    trade_date=tdate,
+                    open=o,
+                    high=h,
+                    low=l,
+                    close=c,
+                    vol=float(row.get("vol", 0.0) or 0.0),
+                    amount=float(row.get("amount", 0.0) or 0.0),
+                    adj=adj,
+                )
+            )
+        bars.sort(key=lambda x: x.trade_date)
+        upserted = self.store.upsert_bars(bars, source="tushare")
+        self.store.record_sync(ts_code, start_date, end_date, upserted, "ok", "")
+        return {"symbol": ts_code, "bars": upserted, "status": "ok"}
+
+    def load_or_sync(self, ts_code: str, start_date: str, end_date: str, adj: str, force: bool = False) -> List[KBar]:
+        bars = self.store.query_bars(ts_code, start_date, end_date, adj=adj)
+        if bars and not force:
+            return bars
+        self.sync_symbol(ts_code=ts_code, start_date=start_date, end_date=end_date, adj=adj, force=force)
+        return self.store.query_bars(ts_code, start_date, end_date, adj=adj)
+
 def _find_prop_name(
     db_props: Dict[str, Dict[str, Any]],
     candidates: List[str],
@@ -771,6 +1009,11 @@ def _resolve_stock_fields(stock_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "out_sell": _find_prop_name(props, ["建议卖出价"], ["number"]),
         "out_stop": _find_prop_name(props, ["建议止损价"], ["number"]),
         "out_pos": _find_prop_name(props, ["建议仓位变化"], ["number"]),
+        "out_buy_shares": _find_prop_name(props, ["建议买入股数"], ["number"]),
+        "out_sell_shares": _find_prop_name(props, ["建议卖出股数"], ["number"]),
+        "out_holding_shares": _find_prop_name(props, ["当前持仓股数", "持仓股数"], ["number"]),
+        "out_market_value": _find_prop_name(props, ["持仓市值", "市值"], ["number"]),
+        "out_unrealized_pnl": _find_prop_name(props, ["浮动盈亏", "未实现盈亏"], ["number"]),
         "out_conf": _find_prop_name(props, ["建议置信度"], ["select", "status", "rich_text", "title"]),
         "out_mode": _find_prop_name(props, ["建议模式"], ["select", "status", "rich_text", "title"]),
         "out_reason": _find_prop_name(props, ["建议原因", "触发原因"], ["rich_text", "title"]),
@@ -780,14 +1023,26 @@ def _resolve_stock_fields(stock_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 def _resolve_trade_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
     props = trade_db.get("properties", {})
-    return {
-        "date": _find_prop_name(props, ["鏃ユ湡"], ["date"]),
-        "direction": _find_prop_name(props, ["鏂瑰悜"], ["select", "status"]),
-        "shares": _find_prop_name(props, ["鑲℃暟"], ["number"]),
-        "price": _find_prop_name(props, ["浠锋牸"], ["number"]),
-        "stock": _find_prop_name(props, ["鑲＄エ"], ["relation"]),
+    fields = {
+        "date": _find_prop_name(props, ["日期", "交易日期", "下单日期", "鏃ユ湡"], ["date"]),
+        "direction": _find_prop_name(props, ["方向", "交易方向", "买卖方向", "鏂瑰悜"], ["select", "status"]),
+        "shares": _find_prop_name(props, ["股数", "数量", "成交数量", "鑲℃暟"], ["number"]),
+        "price": _find_prop_name(props, ["价格", "成交价", "成交价格", "浠锋牸"], ["number"]),
+        "stock": _find_prop_name(props, ["股票", "标的", "证券", "鑲＄エ"], ["relation"]),
         "realized": _find_prop_name(props, ["单笔已实现收益"], ["formula", "number"]),
     }
+
+    if not fields.get("date"):
+        fields["date"] = _find_prop_by_keywords(props, ["日期"], ["date"])
+    if not fields.get("direction"):
+        fields["direction"] = _find_prop_by_keywords(props, ["方向"], ["select", "status"])
+    if not fields.get("shares"):
+        fields["shares"] = _find_prop_by_keywords(props, ["股", "数量"], ["number"])
+    if not fields.get("price"):
+        fields["price"] = _find_prop_by_keywords(props, ["价"], ["number"])
+    if not fields.get("stock"):
+        fields["stock"] = _find_prop_by_keywords(props, ["股票", "标的", "证券"], ["relation"])
+    return fields
 
 
 def _resolve_trade_write_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -844,6 +1099,16 @@ def _resolve_stock_fields_runtime(stock_db: Dict[str, Any]) -> Dict[str, Optiona
         fields["out_stop"] = _find_prop_by_keywords(props, ["建议止损价"], ["number"])
     if not fields.get("out_pos"):
         fields["out_pos"] = _find_prop_by_keywords(props, ["建议仓位变化"], ["number"])
+    if not fields.get("out_buy_shares"):
+        fields["out_buy_shares"] = _find_prop_by_keywords(props, ["建议买入股数"], ["number"])
+    if not fields.get("out_sell_shares"):
+        fields["out_sell_shares"] = _find_prop_by_keywords(props, ["建议卖出股数"], ["number"])
+    if not fields.get("out_holding_shares"):
+        fields["out_holding_shares"] = _find_prop_by_keywords(props, ["持仓股数"], ["number"])
+    if not fields.get("out_market_value"):
+        fields["out_market_value"] = _find_prop_by_keywords(props, ["持仓市值", "市值"], ["number"])
+    if not fields.get("out_unrealized_pnl"):
+        fields["out_unrealized_pnl"] = _find_prop_by_keywords(props, ["浮动盈亏", "未实现盈亏"], ["number"])
     if not fields.get("out_conf"):
         fields["out_conf"] = _find_prop_by_keywords(props, ["建议置信度"], ["select", "status", "rich_text", "title"])
     if not fields.get("out_mode"):
@@ -876,6 +1141,226 @@ def _normalize_cn_symbol(raw_code: str) -> Optional[str]:
         return f"{suffix}{code[:6]}"
     return None
 
+
+def _to_tushare_ts_code(raw_code: str) -> Optional[str]:
+    code = (raw_code or "").strip().upper()
+    if not code:
+        return None
+    digits = "".join(ch for ch in code if ch.isdigit())
+    if len(digits) == 6:
+        suffix = "SH" if digits.startswith(("5", "6", "9")) else "SZ"
+        return f"{digits}.{suffix}"
+    if "." in code:
+        left, right = code.split(".", 1)
+        if left.isdigit() and len(left) == 6 and right in {"SH", "SZ", "SS"}:
+            return f"{left}.{'SH' if right == 'SS' else right}"
+    if code.startswith(("SH", "SZ")) and len(code) == 8 and code[2:].isdigit():
+        return f"{code[2:]}.{code[:2]}"
+    return None
+
+
+def _default_kline_start(end_date: str, lookback_days: int = 420) -> str:
+    end_dt = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+    start_dt = end_dt - dt.timedelta(days=max(lookback_days, 30))
+    return start_dt.isoformat()
+
+
+def _account_row_code() -> str:
+    return (os.getenv("ACCOUNT_ROW_CODE", "ACCOUNT") or "ACCOUNT").strip().upper()
+
+
+def _is_account_row(row: Dict[str, Any], stock_fields: Dict[str, Optional[str]]) -> bool:
+    target = _account_row_code()
+    code = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
+    title = p_title(row, stock_fields["title"]) if stock_fields.get("title") else ""
+    return (code or "").strip().upper() == target or (title or "").strip().upper() == target
+
+
+def _resolve_cash_config_fields(cash_db: Dict[str, Any], pref_name: str) -> Dict[str, Optional[str]]:
+    props = cash_db.get("properties", {})
+    return {
+        "cash": _find_prop_name(props, [pref_name, "可流动现金", "现金", "cash"], ["number", "rich_text", "title"]),
+    }
+
+
+def _num_from_prop_any(page: Dict[str, Any], key: Optional[str]) -> Optional[float]:
+    if not key:
+        return None
+    prop = get_prop(page, key)
+    if not prop:
+        return None
+    typ = prop.get("type")
+    if typ == "number":
+        num = prop.get("number")
+        return float(num) if num is not None else None
+    if typ in {"rich_text", "title"}:
+        text = _prop_text_any(page, key).replace(",", "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+    return None
+
+
+def _load_cash_from_config_db(client: NotionClient, cfg: Cfg) -> float:
+    db_id = (cfg.cash_config_id or "").strip()
+    if not db_id:
+        raise RuntimeError("Missing DB_CASH_CONFIG_ID.")
+    pref = (os.getenv("CASH_FIELD_NAME", "可流动现金") or "可流动现金").strip()
+    db = client.get_database(db_id)
+    fields = _resolve_cash_config_fields(db, pref_name=pref)
+    key = fields.get("cash")
+    if not key:
+        raise RuntimeError(f"Cash config DB missing field: {pref}")
+    rows = client.query_database_all(db_id)
+    if not rows:
+        raise RuntimeError("Cash config DB has no records.")
+    val = _num_from_prop_any(rows[0], key)
+    if val is not None and val > 0:
+        return float(val)
+    fallback = os.getenv("TOTAL_CASH_FALLBACK", "").replace(",", "").strip()
+    if fallback:
+        try:
+            v = float(fallback)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    raise RuntimeError("Cash config value invalid and TOTAL_CASH_FALLBACK not set.")
+
+
+def _read_cash_config_formula_summary(client: NotionClient, cfg: Cfg) -> Dict[str, Optional[float]]:
+    db_id = (cfg.cash_config_id or "").strip()
+    if not db_id:
+        return {}
+    pref_asset = (os.getenv("CASH_TOTAL_ASSET_FIELD_NAME", "总资产") or "总资产").strip()
+    pref_mkt = (os.getenv("CASH_MARKET_VALUE_FIELD_NAME", "总持仓市值") or "总持仓市值").strip()
+    pref_unr = (os.getenv("CASH_UNREALIZED_FIELD_NAME", "总浮动盈亏") or "总浮动盈亏").strip()
+    pref_total_pnl = (os.getenv("CASH_TOTAL_PNL_FIELD_NAME", "总盈亏") or "总盈亏").strip()
+    pref_realized = (os.getenv("CASH_REALIZED_FIELD_NAME", "已实现盈亏") or "已实现盈亏").strip()
+
+    db = client.get_database(db_id)
+    rows = client.query_database_all(db_id)
+    if not rows:
+        return {}
+    row = rows[0]
+    props = db.get("properties", {})
+
+    def pick(candidates: List[str]) -> Optional[str]:
+        return _find_prop_name(props, candidates, ["number", "formula", "rollup", "rich_text", "title"])
+
+    keys = {
+        "total_asset": pick([pref_asset, "总资产", "total_asset"]),
+        "market_value_total": pick([pref_mkt, "总持仓市值", "持仓市值合计", "market_value_total"]),
+        "unrealized_pnl_total": pick([pref_unr, "总浮动盈亏", "未实现盈亏合计", "unrealized_pnl_total"]),
+        "total_pnl": pick([pref_total_pnl, "总盈亏", "total_pnl"]),
+        "realized_pnl_total": pick([pref_realized, "已实现盈亏", "realized_pnl_total"]),
+    }
+
+    out: Dict[str, Optional[float]] = {}
+    for k, key in keys.items():
+        if not key:
+            out[k] = None
+            continue
+        prop = get_prop(row, key)
+        typ = prop.get("type")
+        val: Optional[float] = None
+        if typ == "number":
+            num = prop.get("number")
+            val = float(num) if num is not None else None
+        elif typ == "formula":
+            f = prop.get("formula", {})
+            if f.get("type") == "number" and f.get("number") is not None:
+                val = float(f.get("number"))
+        elif typ == "rollup":
+            r = prop.get("rollup", {})
+            if r.get("type") == "number" and r.get("number") is not None:
+                val = float(r.get("number"))
+        elif typ in {"rich_text", "title"}:
+            val = _num_from_prop_any(row, key)
+        out[k] = val
+    return out
+
+
+def _build_reconcile_result(code_summary: Dict[str, float], notion_summary: Dict[str, Optional[float]]) -> Dict[str, Any]:
+    threshold = float(os.getenv("CASH_RECONCILE_THRESHOLD", "1.0") or 1.0)
+    checks = []
+    max_delta = 0.0
+    keys = ["total_asset", "market_value_total", "unrealized_pnl_total", "realized_pnl_total", "total_pnl"]
+    for key in keys:
+        code_v = float(code_summary.get(key, 0.0) or 0.0)
+        notion_v = notion_summary.get(key)
+        if notion_v is None:
+            continue
+        delta = abs(code_v - float(notion_v))
+        max_delta = max(max_delta, delta)
+        checks.append({"key": key, "code": code_v, "notion": float(notion_v), "delta": delta})
+    has_reference = len(checks) > 0
+    ok = (max_delta <= threshold) if has_reference else True
+    return {
+        "has_reference": has_reference,
+        "threshold": threshold,
+        "max_delta": max_delta,
+        "ok": ok,
+        "checks": checks,
+    }
+
+
+def _resolve_trade_cost_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    props = trade_db.get("properties", {})
+    return {
+        "fee": _find_prop_name(props, ["手续费", "费用"], ["number"]),
+        "tax": _find_prop_name(props, ["税费", "印花税"], ["number"]),
+    }
+
+
+def _replay_positions_from_trades(
+    trade_rows: List[Dict[str, Any]],
+    trade_fields: Dict[str, Optional[str]],
+    cost_fields: Dict[str, Optional[str]],
+) -> Tuple[Dict[str, float], Dict[str, float], float]:
+    rows = sorted(trade_rows, key=lambda r: (p_date(r, trade_fields["date"]) if trade_fields.get("date") else "", str(r.get("id", ""))))
+    holding_shares_by_stock: Dict[str, float] = defaultdict(float)
+    holding_avg_cost_by_stock: Dict[str, float] = defaultdict(float)
+    realized_pnl_total = 0.0
+    for row in rows:
+        stock_ids = p_relation_ids(row, trade_fields["stock"]) if trade_fields.get("stock") else []
+        if not stock_ids:
+            continue
+        sid = stock_ids[0]
+        direction = p_select(row, trade_fields["direction"]).strip().upper() if trade_fields.get("direction") else ""
+        shares = float(p_number(row, trade_fields["shares"]) or 0.0) if trade_fields.get("shares") else 0.0
+        price = float(p_number(row, trade_fields["price"]) or 0.0) if trade_fields.get("price") else 0.0
+        fee = float(p_number(row, cost_fields["fee"]) or 0.0) if cost_fields.get("fee") else 0.0
+        tax = float(p_number(row, cost_fields["tax"]) or 0.0) if cost_fields.get("tax") else 0.0
+        if shares <= 0 or price <= 0:
+            continue
+        old_shares = float(holding_shares_by_stock.get(sid, 0.0))
+        old_avg = float(holding_avg_cost_by_stock.get(sid, 0.0))
+        if direction == "BUY":
+            total_cost = old_shares * old_avg + shares * price + fee + tax
+            new_shares = old_shares + shares
+            holding_shares_by_stock[sid] = new_shares
+            holding_avg_cost_by_stock[sid] = (total_cost / new_shares) if new_shares > 0 else 0.0
+        elif direction == "SELL":
+            sell_shares = min(shares, old_shares)
+            if sell_shares <= 0:
+                continue
+            matched_cost = sell_shares * old_avg
+            proceeds = sell_shares * price - fee - tax
+            realized_pnl_total += proceeds - matched_cost
+            remain = old_shares - sell_shares
+            holding_shares_by_stock[sid] = remain
+            holding_avg_cost_by_stock[sid] = old_avg if remain > 0 else 0.0
+    return dict(holding_shares_by_stock), dict(holding_avg_cost_by_stock), float(realized_pnl_total)
+
+
+def _round_lot_a(share_count: float) -> int:
+    if share_count <= 0:
+        return 0
+    return int(math.floor(share_count / 100.0) * 100)
 
 def _parse_tencent_quote_line(line: str) -> Tuple[Optional[str], Optional[float]]:
     if "=" not in line:
@@ -959,6 +1444,68 @@ def sync_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def sync_kline(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+    stock_db = client.get_database(cfg.stock_master_id)
+    stock_fields = _resolve_stock_fields_runtime(stock_db)
+    stock_rows = client.query_database_all(cfg.stock_master_id)
+    end_date = _today_or(getattr(args, "end_date", ""))
+    start_date = _today_or(getattr(args, "start_date", "")) if getattr(args, "start_date", "") else _default_kline_start(end_date)
+    adj = _coerce_text(getattr(args, "adj", os.getenv("KLINE_DEFAULT_ADJ", "raw"))).strip().lower() or "raw"
+    if adj not in {"raw", "qfq", "hfq"}:
+        raise RuntimeError("adj must be one of raw/qfq/hfq")
+
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    store = KlineStore(_sqlite_path())
+    provider = KlineProvider(token=token, store=store)
+    symbols = _split_csv(getattr(args, "symbols", ""))
+    ts_codes: List[str] = []
+    if symbols:
+        for raw in symbols:
+            ts_code = _to_tushare_ts_code(raw)
+            if ts_code:
+                ts_codes.append(ts_code)
+    else:
+        for row in stock_rows:
+            code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
+            ts_code = _to_tushare_ts_code(code_raw)
+            if ts_code:
+                ts_codes.append(ts_code)
+    uniq = []
+    for code in ts_codes:
+        if code not in uniq:
+            uniq.append(code)
+
+    details: List[Dict[str, Any]] = []
+    ok = 0
+    fail = 0
+    try:
+        for ts_code in uniq:
+            try:
+                r = provider.sync_symbol(ts_code, start_date=start_date, end_date=end_date, adj=adj, force=bool(getattr(args, "force", False)))
+                details.append(r)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                err = str(e)
+                details.append({"symbol": ts_code, "bars": 0, "status": "error", "error": err})
+                store.record_sync(ts_code, start_date, end_date, 0, "error", err)
+    finally:
+        store.close()
+
+    out = {
+        "symbols_total": len(uniq),
+        "ok": ok,
+        "failed": fail,
+        "start_date": start_date,
+        "end_date": end_date,
+        "adj": adj,
+        "sqlite_path": _sqlite_path(),
+        "details": details,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if fail == 0 else 2
 
 
 def _safe_mean(values: List[float]) -> float:
@@ -1372,7 +1919,7 @@ def _recommend_atr_wave_from_points(
     }
 
 
-def _recommend_by_strategy(
+def _recommend_by_strategy_trade(
     strategy_id: str,
     current_price: Optional[float],
     current_cost: Optional[float],
@@ -1394,20 +1941,356 @@ def _recommend_by_strategy(
     return rec
 
 
+def _kline_close_returns(bars: List[KBar]) -> List[float]:
+    closes = [b.close for b in bars if b.close > 0]
+    out: List[float] = []
+    for i in range(1, len(closes)):
+        prev = closes[i - 1]
+        curr = closes[i]
+        if prev > 0:
+            out.append((curr - prev) / prev)
+    return out
+
+
+def _recommend_from_kbars(
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    bars: List[KBar],
+    allow_small_sample: bool,
+    min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = param_cfg or {}
+    trend_threshold = float(cfg.get("trend_threshold", 0.015))
+    vol_cap = float(cfg.get("vol_cap", 0.10))
+    band_low = float(cfg.get("band_low", 0.01))
+    band_high = float(cfg.get("band_high", 0.12))
+    stop_mult = float(cfg.get("stop_mult", 1.8))
+    rr_min = float(cfg.get("rr_min", 0.8))
+    if current_price is None or current_price <= 0:
+        return {
+            "action": "HOLD",
+            "buy_price": None,
+            "sell_price": None,
+            "stop_price": None,
+            "position_delta": 0.0,
+            "confidence": "LOW",
+            "mode": "TREND_FALLBACK",
+            "reason": "missing current price",
+            "sample_count": len(bars),
+        }
+
+    valid = [b for b in bars if b.close > 0]
+    sample_count = len(valid)
+    mode = "FULL_MODEL" if sample_count >= 20 else "TREND_FALLBACK"
+    if sample_count < 20 and not allow_small_sample:
+        return {
+            "action": "HOLD",
+            "buy_price": round(current_price, 4),
+            "sell_price": round(current_price, 4),
+            "stop_price": round(current_price * 0.98, 4),
+            "position_delta": 0.0,
+            "confidence": "LOW",
+            "mode": "TREND_FALLBACK",
+            "reason": "sample too small",
+            "sample_count": sample_count,
+        }
+
+    returns = _kline_close_returns(valid)
+    conf_score = _confidence_from_history(sample_count, returns[-30:], [])
+    conf_level = _confidence_level(conf_score)
+    if mode == "TREND_FALLBACK" and conf_level == "HIGH":
+        conf_level = "MEDIUM"
+
+    vol = _safe_stdev(returns[-20:]) if returns else 0.02
+    if vol > vol_cap:
+        return {
+            "action": "HOLD",
+            "buy_price": round(current_price * 0.99, 4),
+            "sell_price": round(current_price * 1.01, 4),
+            "stop_price": round(current_price * 0.97, 4),
+            "position_delta": 0.0,
+            "confidence": conf_level,
+            "mode": mode,
+            "reason": "volatility too high",
+            "sample_count": sample_count,
+        }
+
+    closes = [b.close for b in valid]
+    ma_window = min(20, len(closes))
+    moving_avg = _safe_mean(closes[-ma_window:]) if ma_window > 0 else current_price
+    trend = (current_price / moving_avg - 1.0) if moving_avg > 0 else 0.0
+    band = _clamp(max(vol * 1.2, band_low), band_low, band_high)
+
+    buy_price = current_price * (1.0 - band)
+    sell_price = current_price * (1.0 + band)
+    stop_price = current_price * (1.0 - band * stop_mult)
+    if current_cost is not None and current_cost > 0:
+        buy_price = min(buy_price, current_cost * 0.995)
+        sell_price = max(sell_price, current_cost * 1.005)
+
+    action = "HOLD"
+    reason = "neutral"
+    if trend > trend_threshold:
+        action = "BUY"
+        reason = "up trend"
+    elif trend < -trend_threshold:
+        action = "SELL"
+        reason = "down trend"
+
+    expected_up = max(0.0, (sell_price - current_price) / current_price)
+    expected_down = max(0.0, (current_price - stop_price) / current_price)
+    if expected_up <= expected_down * rr_min:
+        action = "HOLD"
+        reason = "risk/reward not favorable"
+    if _level_rank(conf_level) < _level_rank(min_confidence):
+        action = "HOLD"
+        reason = f"confidence {conf_level} < {min_confidence}"
+
+    pos_base = {"HIGH": 0.15, "MEDIUM": 0.10, "LOW": 0.05}[conf_level]
+    if mode == "TREND_FALLBACK":
+        pos_base *= 0.5
+    pos_delta = pos_base if action == "BUY" else (-pos_base if action == "SELL" else 0.0)
+    if mode == "TREND_FALLBACK" and conf_level == "LOW" and action == "BUY":
+        action = "HOLD"
+        pos_delta = 0.0
+        reason = "fallback+low confidence"
+
+    return {
+        "action": action,
+        "buy_price": round(buy_price, 4),
+        "sell_price": round(sell_price, 4),
+        "stop_price": round(stop_price, 4),
+        "position_delta": round(pos_delta, 4),
+        "confidence": conf_level,
+        "mode": mode,
+        "reason": reason,
+        "sample_count": sample_count,
+    }
+
+
+def _recommend_chan_from_kbars(
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    bars: List[KBar],
+    allow_small_sample: bool,
+    min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base = _recommend_from_kbars(current_price, current_cost, bars, allow_small_sample, min_confidence, param_cfg=param_cfg)
+    if current_price is None or current_price <= 0:
+        return base
+    if len(bars) < 7:
+        base["reason"] = "CHAN sample too short; fallback baseline"
+        return base
+
+    fractals: List[Tuple[int, str]] = []
+    for i in range(1, len(bars) - 1):
+        if bars[i].high > bars[i - 1].high and bars[i].high > bars[i + 1].high:
+            fractals.append((i, "TOP"))
+        elif bars[i].low < bars[i - 1].low and bars[i].low < bars[i + 1].low:
+            fractals.append((i, "BOTTOM"))
+
+    pens: List[Tuple[int, int, str]] = []
+    for i in range(1, len(fractals)):
+        p0, t0 = fractals[i - 1]
+        p1, t1 = fractals[i]
+        if t0 == t1:
+            continue
+        pens.append((p0, p1, "UP" if (t0 == "BOTTOM" and t1 == "TOP") else "DOWN"))
+
+    recent = bars[-6:]
+    center = _safe_mean([b.close for b in recent])
+    spread = max(_safe_stdev([b.close for b in recent]), 1e-6)
+    upper = center + spread * 0.6
+    lower = center - spread * 0.6
+    trend_up = len(pens) >= 2 and pens[-1][2] == "UP" and pens[-2][2] == "UP"
+    trend_down = len(pens) >= 2 and pens[-1][2] == "DOWN" and pens[-2][2] == "DOWN"
+
+    action = "HOLD"
+    reason = f"CHAN fractals={len(fractals)} pens={len(pens)} center={center:.4f}"
+    if trend_up and current_price <= upper:
+        action = "BUY"
+        reason = f"{reason}; up-pen continuation near center"
+    elif trend_down and current_price >= lower:
+        action = "SELL"
+        reason = f"{reason}; down-pen continuation near center"
+
+    buy_price = min(base["buy_price"], center) if base["buy_price"] is not None else center
+    sell_price = max(base["sell_price"], center) if base["sell_price"] is not None else center
+    stop_price = min(base["stop_price"], lower - spread * 0.4) if base["stop_price"] is not None else lower
+    conf = base["confidence"]
+    if len(bars) < 20 and conf == "HIGH":
+        conf = "MEDIUM"
+    if _level_rank(conf) < _level_rank(min_confidence):
+        action = "HOLD"
+        reason = f"CHAN confidence {conf} below threshold {min_confidence}"
+
+    pos = base["position_delta"]
+    if action == "BUY" and pos < 0:
+        pos = abs(pos)
+    if action == "SELL" and pos > 0:
+        pos = -abs(pos)
+    if action == "HOLD":
+        pos = 0.0
+
+    return {
+        "action": action,
+        "buy_price": round(float(buy_price), 4),
+        "sell_price": round(float(sell_price), 4),
+        "stop_price": round(float(stop_price), 4),
+        "position_delta": round(float(pos), 4),
+        "confidence": conf,
+        "mode": base["mode"],
+        "reason": reason,
+        "sample_count": base["sample_count"],
+    }
+
+
+def _recommend_atr_wave_from_kbars(
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    bars: List[KBar],
+    allow_small_sample: bool,
+    min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base = _recommend_from_kbars(current_price, current_cost, bars, allow_small_sample, min_confidence, param_cfg=param_cfg)
+    if current_price is None or current_price <= 0:
+        return base
+    if len(bars) < 8:
+        base["reason"] = "ATR_WAVE sample too short; fallback baseline"
+        return base
+
+    tr_values: List[float] = []
+    prev_close = bars[0].close
+    for b in bars[1:]:
+        tr = max(b.high - b.low, abs(b.high - prev_close), abs(b.low - prev_close))
+        tr_values.append(max(tr, 0.0))
+        prev_close = b.close
+    atr_window = min(14, len(tr_values))
+    atr = _safe_mean(tr_values[-atr_window:]) if atr_window > 0 else 0.0
+    closes = [b.close for b in bars]
+    mid = _safe_mean(closes[-min(20, len(closes)) :]) if closes else current_price
+    upper = mid + atr * 1.2
+    lower = mid - atr * 1.2
+
+    action = "HOLD"
+    reason = f"ATR_WAVE atr={atr:.4f} mid={mid:.4f} band=[{lower:.4f},{upper:.4f}]"
+    if current_price > upper:
+        action = "BUY"
+        reason = f"{reason}; breakout above upper band"
+    elif current_price < lower:
+        action = "SELL"
+        reason = f"{reason}; breakdown below lower band"
+    elif abs(current_price - mid) <= max(atr * 0.25, 0.01):
+        action = "HOLD"
+        reason = f"{reason}; mean reversion zone"
+
+    buy_price = min(base["buy_price"], current_price - atr * 0.4) if base["buy_price"] is not None else current_price
+    sell_price = max(base["sell_price"], current_price + atr * 0.8) if base["sell_price"] is not None else current_price
+    stop_price = min(base["stop_price"], current_price - atr * 1.2) if base["stop_price"] is not None else current_price
+    conf = base["confidence"]
+    if len(closes) < 20 and conf == "HIGH":
+        conf = "MEDIUM"
+    if _level_rank(conf) < _level_rank(min_confidence):
+        action = "HOLD"
+        reason = f"ATR_WAVE confidence {conf} below threshold {min_confidence}"
+
+    pos = base["position_delta"]
+    if action == "BUY" and pos < 0:
+        pos = abs(pos)
+    if action == "SELL" and pos > 0:
+        pos = -abs(pos)
+    if action == "HOLD":
+        pos = 0.0
+    return {
+        "action": action,
+        "buy_price": round(float(buy_price), 4),
+        "sell_price": round(float(sell_price), 4),
+        "stop_price": round(float(stop_price), 4),
+        "position_delta": round(float(pos), 4),
+        "confidence": conf,
+        "mode": base["mode"],
+        "reason": reason,
+        "sample_count": base["sample_count"],
+    }
+
+
+def _recommend_by_strategy_kline(
+    strategy_id: str,
+    current_price: Optional[float],
+    current_cost: Optional[float],
+    bars: List[KBar],
+    allow_small_sample: bool,
+    min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sid = strategy_id.lower()
+    if sid == "baseline":
+        rec = _recommend_from_kbars(current_price, current_cost, bars, allow_small_sample, min_confidence, param_cfg=param_cfg)
+    elif sid == "chan":
+        rec = _recommend_chan_from_kbars(current_price, current_cost, bars, allow_small_sample, min_confidence, param_cfg=param_cfg)
+    elif sid == "atr_wave":
+        rec = _recommend_atr_wave_from_kbars(current_price, current_cost, bars, allow_small_sample, min_confidence, param_cfg=param_cfg)
+    else:
+        raise ValueError(f"unsupported strategy: {strategy_id}")
+    rec["strategy_id"] = sid.upper()
+    return rec
+
+
+def _resolve_recommend_data_source(args: argparse.Namespace) -> str:
+    return (_coerce_text(getattr(args, "data_source", "kline")).strip().lower() or "kline")
+
+
+def _load_trade_points_for_recommendation(client: NotionClient, cfg: Cfg) -> Dict[str, List[TradePoint]]:
+    trade_db = client.get_database(cfg.std_trades_id)
+    trade_fields = _resolve_trade_fields(trade_db)
+    for key in ["date", "direction", "shares", "price", "stock"]:
+        if not trade_fields[key]:
+            raise RuntimeError(f"Missing required standard-trade field mapping: {key}")
+    trade_rows = client.query_database_all(cfg.std_trades_id)
+    return _build_trade_points(trade_rows, trade_fields)
+
+
+def _load_kbars_for_stocks(
+    stock_rows: List[Dict[str, Any]],
+    stock_fields: Dict[str, Optional[str]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, List[KBar]], Dict[str, str]]:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    adj = _coerce_text(getattr(args, "adj", os.getenv("KLINE_DEFAULT_ADJ", "raw"))).strip().lower() or "raw"
+    if adj not in {"raw", "qfq", "hfq"}:
+        raise RuntimeError("adj must be one of raw/qfq/hfq")
+    end_date = _today_or(getattr(args, "end_date", ""))
+    start_date = _today_or(getattr(args, "start_date", "")) if getattr(args, "start_date", "") else _default_kline_start(end_date)
+    force = bool(getattr(args, "force", False))
+    store = KlineStore(_sqlite_path())
+    provider = KlineProvider(token=token, store=store)
+    by_stock: Dict[str, List[KBar]] = {}
+    by_stock_symbol: Dict[str, str] = {}
+    try:
+        for row in stock_rows:
+            stock_id = row.get("id", "")
+            code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
+            ts_code = _to_tushare_ts_code(code_raw)
+            if not stock_id or not ts_code:
+                continue
+            bars = provider.load_or_sync(ts_code, start_date=start_date, end_date=end_date, adj=adj, force=force)
+            by_stock[stock_id] = bars
+            by_stock_symbol[stock_id] = ts_code
+    finally:
+        store.close()
+    return by_stock, by_stock_symbol
+
+
 def _prepare_recommendation_context(
     client: NotionClient,
     cfg: Cfg,
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Optional[str]], List[Dict[str, Any]], Dict[str, List[TradePoint]]]:
+) -> Tuple[Dict[str, Any], Dict[str, Optional[str]], List[Dict[str, Any]], Dict[str, List[TradePoint]], Dict[str, List[KBar]], Dict[str, str]]:
     stock_db = client.get_database(cfg.stock_master_id)
-    trade_db = client.get_database(cfg.std_trades_id)
     stock_fields = _resolve_stock_fields_runtime(stock_db)
-    trade_fields = _resolve_trade_fields(trade_db)
-
-    for key in ["date", "direction", "shares", "price", "stock"]:
-        if not trade_fields[key]:
-            raise RuntimeError(f"Missing required standard-trade field mapping: {key}")
-
     stock_rows = client.query_database_all(cfg.stock_master_id)
     if getattr(args, "refresh_prices", False):
         sync_prices(
@@ -1416,15 +2299,24 @@ def _prepare_recommendation_context(
             argparse.Namespace(dry_run=bool(getattr(args, "dry_run", False)), timeout=getattr(args, "timeout", 8)),
         )
         stock_rows = client.query_database_all(cfg.stock_master_id)
-    trade_rows = client.query_database_all(cfg.std_trades_id)
-    stock_points = _build_trade_points(trade_rows, trade_fields)
-    return stock_db, stock_fields, stock_rows, stock_points
+
+    data_source = _resolve_recommend_data_source(args)
+    stock_points: Dict[str, List[TradePoint]] = {}
+    stock_kbars: Dict[str, List[KBar]] = {}
+    stock_symbols: Dict[str, str] = {}
+    if data_source == "trade":
+        stock_points = _load_trade_points_for_recommendation(client, cfg)
+    else:
+        stock_kbars, stock_symbols = _load_kbars_for_stocks(stock_rows, stock_fields, args)
+    return stock_db, stock_fields, stock_rows, stock_points, stock_kbars, stock_symbols
 
 
 def _collect_recommendations(
     stock_rows: List[Dict[str, Any]],
     stock_fields: Dict[str, Optional[str]],
     stock_points: Dict[str, List[TradePoint]],
+    stock_kbars: Dict[str, List[KBar]],
+    stock_symbols: Dict[str, str],
     args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
@@ -1432,35 +2324,57 @@ def _collect_recommendations(
     market_rule = os.getenv("SNAPSHOT_MARKET_RULE", "")
     override_market = (getattr(args, "param_market", "") or "").strip().upper()
     scope = (getattr(args, "param_scope", "") or "*").strip() or "*"
+    data_source = _resolve_recommend_data_source(args)
     store = ParamStore(_sqlite_path())
     param_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     try:
         for row in stock_rows:
+            if _is_account_row(row, stock_fields):
+                continue
             stock_id = row.get("id", "")
             title = p_title(row, stock_fields["title"]) if stock_fields["title"] else stock_id
             code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
+            symbol = stock_symbols.get(stock_id, "")
             current_price = p_number(row, stock_fields["current_price"]) if stock_fields["current_price"] else None
             current_cost = p_number(row, stock_fields["current_cost"]) if stock_fields["current_cost"] else None
-            market = override_market or _market_from_rule(code_raw, market_rule)
+            kbars = stock_kbars.get(stock_id, [])
+            if data_source == "kline" and current_price is None and kbars:
+                current_price = kbars[-1].close
+            market_code = code_raw or symbol
+            market = override_market or _market_from_rule(market_code, market_rule)
+
             for sid in selected_strategies:
                 key = (sid.upper(), market.upper(), scope)
                 if key not in param_cache:
                     param_cache[key] = store.get_active_param_set(strategy_id=sid, market=market, symbol_scope=scope)
                 active = param_cache[key]
                 param_cfg = active.get("params", {})
-                rec = _recommend_by_strategy(
-                    strategy_id=sid,
-                    current_price=current_price,
-                    current_cost=current_cost,
-                    points=stock_points.get(stock_id, []),
-                    allow_small_sample=bool(param_cfg.get("allow_small_sample", args.allow_small_sample)),
-                    min_confidence=str(param_cfg.get("min_confidence", args.min_confidence)),
-                    param_cfg=param_cfg,
-                )
+                if data_source == "trade":
+                    rec = _recommend_by_strategy_trade(
+                        strategy_id=sid,
+                        current_price=current_price,
+                        current_cost=current_cost,
+                        points=stock_points.get(stock_id, []),
+                        allow_small_sample=bool(param_cfg.get("allow_small_sample", args.allow_small_sample)),
+                        min_confidence=str(param_cfg.get("min_confidence", args.min_confidence)),
+                        param_cfg=param_cfg,
+                    )
+                else:
+                    rec = _recommend_by_strategy_kline(
+                        strategy_id=sid,
+                        current_price=current_price,
+                        current_cost=current_cost,
+                        bars=kbars,
+                        allow_small_sample=bool(param_cfg.get("allow_small_sample", args.allow_small_sample)),
+                        min_confidence=str(param_cfg.get("min_confidence", args.min_confidence)),
+                        param_cfg=param_cfg,
+                    )
                 rec["stock_id"] = stock_id
                 rec["stock_name"] = title
                 rec["stock_code"] = code_raw
+                rec["symbol"] = symbol
                 rec["market"] = market
+                rec["data_source"] = data_source
                 rec["param_version"] = active.get("version", 0)
                 rec["param_snapshot"] = param_cfg
                 recs.append(rec)
@@ -1469,23 +2383,21 @@ def _collect_recommendations(
     return recs
 
 
-def _price_returns(points: List[TradePoint]) -> List[float]:
-    valid_prices = [p.price for p in points if p.price is not None and p.price > 0]
+def _series_returns(prices: List[float]) -> List[float]:
     out: List[float] = []
-    for i in range(1, len(valid_prices)):
-        prev = valid_prices[i - 1]
-        curr = valid_prices[i]
+    for i in range(1, len(prices)):
+        prev = prices[i - 1]
+        curr = prices[i]
         if prev > 0:
             out.append((curr - prev) / prev)
     return out
 
 
-def _ret_1d(points: List[TradePoint]) -> float:
-    valid_prices = [p.price for p in points if p.price is not None and p.price > 0]
-    if len(valid_prices) < 2:
+def _ret_1d(prices: List[float]) -> float:
+    if len(prices) < 2:
         return 0.0
-    prev = valid_prices[-2]
-    curr = valid_prices[-1]
+    prev = prices[-2]
+    curr = prices[-1]
     if prev <= 0:
         return 0.0
     return float((curr - prev) / prev)
@@ -1501,7 +2413,7 @@ def _hit_flag(action: str, ret_1d: float) -> int:
 
 def _build_snapshot_rows(
     recs: List[Dict[str, Any]],
-    stock_points: Dict[str, List[TradePoint]],
+    stock_prices: Dict[str, List[float]],
     snapshot_date: str,
     market_rule: str,
     run_id: str,
@@ -1510,9 +2422,9 @@ def _build_snapshot_rows(
     rows: List[Dict[str, Any]] = []
     for rec in recs:
         stock_id = rec.get("stock_id", "")
-        points = stock_points.get(stock_id, [])
-        returns = _price_returns(points)
-        ret_1d = _ret_1d(points)
+        prices = stock_prices.get(stock_id, [])
+        returns = _series_returns(prices)
+        ret_1d = _ret_1d(prices)
         stock_code = _coerce_text(rec.get("stock_code", ""))
         row = {
             "snapshot_date": snapshot_date,
@@ -1541,11 +2453,11 @@ def _build_snapshot_rows(
     return rows
 
 
-def _emit_snapshot(recs: List[Dict[str, Any]], stock_points: Dict[str, List[TradePoint]], snapshot_date: str, dry_run: bool) -> Dict[str, Any]:
+def _emit_snapshot(recs: List[Dict[str, Any]], stock_prices: Dict[str, List[float]], snapshot_date: str, dry_run: bool) -> Dict[str, Any]:
     run_id = uuid4().hex[:12]
     rows = _build_snapshot_rows(
         recs=recs,
-        stock_points=stock_points,
+        stock_prices=stock_prices,
         snapshot_date=snapshot_date,
         market_rule=os.getenv("SNAPSHOT_MARKET_RULE", ""),
         run_id=run_id,
@@ -1568,18 +2480,194 @@ def _emit_snapshot(recs: List[Dict[str, Any]], stock_points: Dict[str, List[Trad
     }
 
 
+def _build_latest_price_map(
+    stock_rows: List[Dict[str, Any]],
+    stock_fields: Dict[str, Optional[str]],
+    stock_kbars: Dict[str, List[KBar]],
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for row in stock_rows:
+        if _is_account_row(row, stock_fields):
+            continue
+        sid = row.get("id", "")
+        if not sid:
+            continue
+        px = p_number(row, stock_fields["current_price"]) if stock_fields.get("current_price") else None
+        if px is None:
+            bars = stock_kbars.get(sid, [])
+            if bars:
+                px = bars[-1].close
+        if px is not None and float(px) > 0:
+            out[sid] = float(px)
+    return out
+
+
+def _build_position_valuation(
+    holding_shares_by_stock: Dict[str, float],
+    holding_avg_cost_by_stock: Dict[str, float],
+    latest_price_by_stock: Dict[str, float],
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for sid, shares in holding_shares_by_stock.items():
+        shares_f = float(shares or 0.0)
+        if shares_f <= 0:
+            continue
+        avg = float(holding_avg_cost_by_stock.get(sid, 0.0) or 0.0)
+        px = float(latest_price_by_stock.get(sid, 0.0) or 0.0)
+        market_value = shares_f * px if px > 0 else 0.0
+        unrealized = shares_f * (px - avg) if px > 0 else 0.0
+        out[sid] = {
+            "holding_shares_now": float(shares_f),
+            "avg_cost_now": float(avg),
+            "last_price_now": float(px),
+            "market_value_now": float(market_value),
+            "unrealized_pnl_now": float(unrealized),
+            "priced_flag": 1.0 if px > 0 else 0.0,
+        }
+    return out
+
+
+def _calc_account_summary(
+    cash: float,
+    position_valuation_by_stock: Dict[str, Dict[str, float]],
+    realized_pnl_total: float,
+) -> Dict[str, float]:
+    market_value_total = 0.0
+    invested_cost_total = 0.0
+    unrealized_pnl_total = 0.0
+    priced_positions = 0
+    unpriced_positions = 0
+    for item in position_valuation_by_stock.values():
+        market_value_total += float(item.get("market_value_now", 0.0) or 0.0)
+        unrealized_pnl_total += float(item.get("unrealized_pnl_now", 0.0) or 0.0)
+        shares = float(item.get("holding_shares_now", 0.0) or 0.0)
+        avg = float(item.get("avg_cost_now", 0.0) or 0.0)
+        invested_cost_total += shares * avg
+        if float(item.get("priced_flag", 0.0) or 0.0) > 0:
+            priced_positions += 1
+        else:
+            unpriced_positions += 1
+    total_asset = cash + market_value_total
+    total_pnl = float(realized_pnl_total) + unrealized_pnl_total
+    return {
+        "cash": float(cash),
+        "market_value_total": float(market_value_total),
+        "invested_cost_total": float(invested_cost_total),
+        "realized_pnl_total": float(realized_pnl_total),
+        "unrealized_pnl_total": float(unrealized_pnl_total),
+        "total_asset": float(total_asset),
+        "total_pnl": float(total_pnl),
+        "priced_positions": float(priced_positions),
+        "unpriced_positions": float(unpriced_positions),
+    }
+
+
+def _attach_position_sizing(
+    recs: List[Dict[str, Any]],
+    sizing_base_asset: float,
+    holding_shares_by_stock: Dict[str, float],
+) -> None:
+    for rec in recs:
+        sid = _coerce_text(rec.get("stock_id", ""))
+        action = _coerce_text(rec.get("action", "")).upper()
+        pos_delta = float(rec.get("position_delta", 0.0) or 0.0)
+        buy_price = rec.get("buy_price")
+        sell_price = rec.get("sell_price")
+        holding_shares = float(holding_shares_by_stock.get(sid, 0.0) or 0.0)
+        holding_lot = _round_lot_a(holding_shares)
+
+        target_value_delta = float(sizing_base_asset) * pos_delta
+        suggest_buy_shares = 0
+        suggest_sell_shares = 0
+        estimated_trade_value = 0.0
+        sizing_note = ""
+
+        exec_price_buy = float(buy_price) if buy_price is not None else None
+        exec_price_sell = float(sell_price) if sell_price is not None else None
+
+        if action == "BUY":
+            if exec_price_buy and exec_price_buy > 0 and target_value_delta > 0:
+                suggest_buy_shares = _round_lot_a(target_value_delta / exec_price_buy)
+                estimated_trade_value = float(suggest_buy_shares) * exec_price_buy
+            else:
+                sizing_note = "BUY 无有效买入价或仓位变化<=0，建议股数=0"
+        elif action == "SELL":
+            if exec_price_sell and exec_price_sell > 0 and target_value_delta < 0:
+                raw_shares = _round_lot_a(abs(target_value_delta) / exec_price_sell)
+                suggest_sell_shares = min(raw_shares, holding_lot)
+                estimated_trade_value = float(suggest_sell_shares) * exec_price_sell
+                if raw_shares > holding_lot:
+                    sizing_note = "卖出建议已按当前持仓上限截断"
+            else:
+                sizing_note = "SELL 无有效卖出价或仓位变化>=0，建议股数=0"
+        else:
+            sizing_note = "HOLD 不建议下单股数"
+
+        rec["holding_shares_now"] = float(holding_shares)
+        rec["target_value_delta"] = float(target_value_delta)
+        rec["exec_price_buy"] = exec_price_buy
+        rec["exec_price_sell"] = exec_price_sell
+        rec["suggest_buy_shares"] = int(suggest_buy_shares)
+        rec["suggest_sell_shares"] = int(suggest_sell_shares)
+        rec["estimated_trade_value"] = float(estimated_trade_value)
+        rec["sizing_note"] = sizing_note
+
+
 def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
-    stock_db, stock_fields, stock_rows, stock_points = _prepare_recommendation_context(client, cfg, args)
+    stock_db, stock_fields, stock_rows, stock_points, stock_kbars, stock_symbols = _prepare_recommendation_context(client, cfg, args)
+    _ = stock_symbols
 
     db_props = stock_db.get("properties", {})
     asof_date = args.asof_date or dt.date.today().isoformat()
 
-    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, args)
+    cash_input = _load_cash_from_config_db(client, cfg)
+    trade_db = client.get_database(cfg.std_trades_id)
+    trade_rows = client.query_database_all(cfg.std_trades_id)
+    trade_fields = _resolve_trade_fields(trade_db)
+    cost_fields = _resolve_trade_cost_fields(trade_db)
+    holding_shares_by_stock, holding_avg_cost_by_stock, realized_pnl_total = _replay_positions_from_trades(
+        trade_rows=trade_rows,
+        trade_fields=trade_fields,
+        cost_fields=cost_fields,
+    )
+
+    need_kline_fallback = any(p_number(row, stock_fields["current_price"]) is None for row in stock_rows if stock_fields.get("current_price"))
+    if need_kline_fallback and not stock_kbars and os.getenv("TUSHARE_TOKEN", "").strip():
+        kbars_for_price, _ = _load_kbars_for_stocks(stock_rows, stock_fields, args)
+        for sid, bars in kbars_for_price.items():
+            if sid not in stock_kbars:
+                stock_kbars[sid] = bars
+    latest_price_by_stock = _build_latest_price_map(stock_rows, stock_fields, stock_kbars)
+    position_valuation_by_stock = _build_position_valuation(
+        holding_shares_by_stock=holding_shares_by_stock,
+        holding_avg_cost_by_stock=holding_avg_cost_by_stock,
+        latest_price_by_stock=latest_price_by_stock,
+    )
+    account_summary = _calc_account_summary(
+        cash=cash_input,
+        position_valuation_by_stock=position_valuation_by_stock,
+        realized_pnl_total=realized_pnl_total,
+    )
+    notion_formula_summary = _read_cash_config_formula_summary(client, cfg)
+    account_summary["notion_formula_summary"] = notion_formula_summary
+    account_summary["reconcile"] = _build_reconcile_result(account_summary, notion_formula_summary)
+
+    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, stock_kbars, stock_symbols, args)
+    _attach_position_sizing(recs, sizing_base_asset=account_summary.get("total_asset", 0.0), holding_shares_by_stock=holding_shares_by_stock)
+    for rec in recs:
+        sid = _coerce_text(rec.get("stock_id", ""))
+        pos = position_valuation_by_stock.get(sid, {})
+        rec["market_value_now"] = float(pos.get("market_value_now", 0.0) or 0.0)
+        rec["unrealized_pnl_now"] = float(pos.get("unrealized_pnl_now", 0.0) or 0.0)
+        rec["avg_cost_now"] = float(pos.get("avg_cost_now", 0.0) or 0.0)
+        rec["last_price_now"] = float(pos.get("last_price_now", 0.0) or 0.0)
     rec_by_stock: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for rec in recs:
         rec_by_stock[rec.get("stock_id", "")].append(rec)
 
     for row in stock_rows:
+        if _is_account_row(row, stock_fields):
+            continue
         stock_id = row.get("id", "")
         if args.dry_run:
             continue
@@ -1602,6 +2690,11 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
             (stock_fields["out_sell"], rec_for_write["sell_price"]),
             (stock_fields["out_stop"], rec_for_write["stop_price"]),
             (stock_fields["out_pos"], rec_for_write["position_delta"]),
+            (stock_fields.get("out_buy_shares"), rec_for_write.get("suggest_buy_shares")),
+            (stock_fields.get("out_sell_shares"), rec_for_write.get("suggest_sell_shares")),
+            (stock_fields.get("out_holding_shares"), rec_for_write.get("holding_shares_now")),
+            (stock_fields.get("out_market_value"), rec_for_write.get("market_value_now")),
+            (stock_fields.get("out_unrealized_pnl"), rec_for_write.get("unrealized_pnl_now")),
             (stock_fields["out_conf"], rec_for_write["confidence"]),
             (stock_fields["out_mode"], rec_for_write["mode"]),
             (stock_fields["out_reason"], f"[{rec_for_write['strategy_id']}] {rec_for_write['reason']}"),
@@ -1617,14 +2710,22 @@ def recommend_prices(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -
             client.update_page(stock_id, props)
 
     if getattr(args, "emit_snapshot", False):
+        stock_prices: Dict[str, List[float]] = {}
+        if _resolve_recommend_data_source(args) == "trade":
+            for sid, points in stock_points.items():
+                stock_prices[sid] = [p.price for p in points if p.price is not None and p.price > 0]
+        else:
+            for sid, bars in stock_kbars.items():
+                stock_prices[sid] = [b.close for b in bars if b.close > 0]
         _emit_snapshot(
             recs=recs,
-            stock_points=stock_points,
+            stock_prices=stock_prices,
             snapshot_date=_today_or(getattr(args, "snapshot_date", "")),
             dry_run=bool(getattr(args, "dry_run", False)),
         )
 
-    print(json.dumps(recs, ensure_ascii=False, indent=2))
+    out = {"recommendations": recs, "account_summary": account_summary}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1656,6 +2757,100 @@ def _returns_metrics(returns: List[float]) -> Dict[str, float]:
 
 
 def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
+    if _resolve_recommend_data_source(args) == "trade":
+        return _backtest_recommendation_trade(client, cfg, args)
+
+    stock_db = client.get_database(cfg.stock_master_id)
+    stock_fields = _resolve_stock_fields_runtime(stock_db)
+    stock_rows = client.query_database_all(cfg.stock_master_id)
+    stock_kbars, stock_symbols = _load_kbars_for_stocks(stock_rows, stock_fields, args)
+    selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
+    mode_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_mode_returns: Dict[str, List[float]] = defaultdict(list)
+    strategy_hold_counts: Dict[str, int] = defaultdict(int)
+    strategy_total_counts: Dict[str, int] = defaultdict(int)
+    baseline_returns: List[float] = []
+    all_strategy_returns: List[float] = []
+    override_market = (getattr(args, "param_market", "") or "").upper()
+    market_rule = os.getenv("SNAPSHOT_MARKET_RULE", "")
+    scope = (getattr(args, "param_scope", "") or "*").strip() or "*"
+    store = ParamStore(_sqlite_path())
+    param_cache: Dict[str, Dict[str, Any]] = {}
+
+    row_by_id = {r.get("id", ""): r for r in stock_rows}
+    try:
+        for stock_id, bars in stock_kbars.items():
+            valid = [b for b in bars if b.close > 0]
+            if len(valid) < 8:
+                continue
+            row = row_by_id.get(stock_id, {})
+            code_raw = _prop_text_any(row, stock_fields["stock_code"]) if row else ""
+            market = override_market or _market_from_rule(code_raw or stock_symbols.get(stock_id, ""), market_rule)
+            for idx in range(5, len(valid) - 1):
+                hist = valid[max(0, idx - args.window) : idx]
+                curr = valid[idx]
+                nxt = valid[idx + 1]
+                if curr.close <= 0 or nxt.close <= 0:
+                    continue
+                move = (nxt.close - curr.close) / curr.close
+                baseline_returns.append(move)
+                for sid in selected_strategies:
+                    sid_upper = sid.upper()
+                    cache_key = f"{sid_upper}|{market}|{scope}"
+                    if cache_key not in param_cache:
+                        param_cache[cache_key] = store.get_active_param_set(strategy_id=sid_upper, market=market, symbol_scope=scope)
+                    active = param_cache[cache_key]
+                    p_cfg = active.get("params", {})
+                    rec = _recommend_by_strategy_kline(
+                        strategy_id=sid,
+                        current_price=curr.close,
+                        current_cost=None,
+                        bars=hist,
+                        allow_small_sample=bool(p_cfg.get("allow_small_sample", args.allow_small_sample)),
+                        min_confidence=str(p_cfg.get("min_confidence", args.min_confidence)),
+                        param_cfg=p_cfg,
+                    )
+                    if rec["action"] == "BUY":
+                        strategy_ret = move
+                    elif rec["action"] == "SELL":
+                        strategy_ret = -move
+                    else:
+                        strategy_ret = 0.0
+                    sid_upper = rec["strategy_id"]
+                    strategy_total_counts[sid_upper] += 1
+                    if rec["action"] == "HOLD":
+                        strategy_hold_counts[sid_upper] += 1
+                    strategy_returns[sid_upper].append(strategy_ret)
+                    strategy_mode_returns[f"{sid_upper}:{rec['mode']}"].append(strategy_ret)
+                    mode_returns[rec["mode"]].append(strategy_ret)
+                    all_strategy_returns.append(strategy_ret)
+
+        strategy_metrics: Dict[str, Dict[str, float]] = {}
+        for sid, arr in strategy_returns.items():
+            m = _returns_metrics(arr)
+            total = max(strategy_total_counts.get(sid, 0), 1)
+            hold_ratio = strategy_hold_counts.get(sid, 0) / total
+            m["hold_ratio"] = hold_ratio
+            strategy_metrics[sid] = m
+    finally:
+        store.close()
+
+    out = {
+        "baseline": _returns_metrics(baseline_returns),
+        "strategy_all": _returns_metrics(all_strategy_returns),
+        "strategy_by_mode": {k: _returns_metrics(v) for k, v in mode_returns.items()},
+        "strategy_metrics": strategy_metrics,
+        "strategy_mode_metrics": {k: _returns_metrics(v) for k, v in strategy_mode_returns.items()},
+        "param_versions": {k: int(v.get("version", 0)) for k, v in param_cache.items()},
+        "param_market": override_market or "AUTO",
+        "data_source": "kline",
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _backtest_recommendation_trade(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
     trade_db = client.get_database(cfg.std_trades_id)
     trade_fields = _resolve_trade_fields(trade_db)
     for key in ["date", "direction", "shares", "price", "stock"]:
@@ -1706,7 +2901,7 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
                         param_cache[sid_upper] = store.get_active_param_set(strategy_id=sid_upper, market=market, symbol_scope=scope)
                     active = param_cache[sid_upper]
                     p_cfg = active.get("params", {})
-                    rec = _recommend_by_strategy(
+                    rec = _recommend_by_strategy_trade(
                         strategy_id=sid,
                         current_price=curr.price,
                         current_cost=None,
@@ -1751,20 +2946,29 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
         "strategy_mode_metrics": {k: _returns_metrics(v) for k, v in strategy_mode_returns.items()},
         "param_versions": {k: int(v.get("version", 0)) for k, v in param_cache.items()},
         "param_market": market,
+        "data_source": "trade",
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
 def snapshot_daily(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
-    stock_db, stock_fields, stock_rows, stock_points = _prepare_recommendation_context(client, cfg, args)
+    stock_db, stock_fields, stock_rows, stock_points, stock_kbars, stock_symbols = _prepare_recommendation_context(client, cfg, args)
     _ = stock_db
     _ = stock_fields
     _ = stock_rows
-    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, args)
+    _ = stock_symbols
+    recs = _collect_recommendations(stock_rows, stock_fields, stock_points, stock_kbars, stock_symbols, args)
+    stock_prices: Dict[str, List[float]] = {}
+    if _resolve_recommend_data_source(args) == "trade":
+        for sid, points in stock_points.items():
+            stock_prices[sid] = [p.price for p in points if p.price is not None and p.price > 0]
+    else:
+        for sid, bars in stock_kbars.items():
+            stock_prices[sid] = [b.close for b in bars if b.close > 0]
     result = _emit_snapshot(
         recs=recs,
-        stock_points=stock_points,
+        stock_prices=stock_prices,
         snapshot_date=_today_or(getattr(args, "snapshot_date", "")),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
@@ -2239,6 +3443,10 @@ def build_parser() -> argparse.ArgumentParser:
     s_rec.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_rec.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
     s_rec.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
+    s_rec.add_argument("--data-source", choices=["kline", "trade"], default="kline", help="策略输入数据源，默认 kline")
+    s_rec.add_argument("--adj", choices=["raw", "qfq", "hfq"], default=os.getenv("KLINE_DEFAULT_ADJ", "raw"), help="K线复权口径")
+    s_rec.add_argument("--start-date", default="", help="K线开始日期，默认自动回看")
+    s_rec.add_argument("--end-date", default="", help="K线结束日期，默认今天 YYYY-MM-DD")
     s_rec.add_argument("--refresh-prices", action="store_true", help="先同步实时价格再计算建议")
     s_rec.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
     s_rec.add_argument("--emit-snapshot", action="store_true", help="recommend后写入每日快照")
@@ -2247,17 +3455,29 @@ def build_parser() -> argparse.ArgumentParser:
     s_rec.add_argument("--param-scope", default="*", help="参数作用域，默认 *")
 
     s_bt = sub.add_parser("backtest-recommendation", help="回测建议模型")
-    s_bt.add_argument("--window", type=int, default=60, help="历史窗口长度（按交易事件）")
+    s_bt.add_argument("--window", type=int, default=60, help="历史窗口长度（默认按日线K线）")
     s_bt.add_argument("--allow-small-sample", action="store_true", default=True)
     s_bt.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_bt.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
     s_bt.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
-    s_bt.add_argument("--param-market", default="SH", help="参数市场，回测默认 SH")
+    s_bt.add_argument("--data-source", choices=["kline", "trade"], default="kline", help="回测输入数据源，默认 kline")
+    s_bt.add_argument("--adj", choices=["raw", "qfq", "hfq"], default=os.getenv("KLINE_DEFAULT_ADJ", "raw"), help="K线复权口径")
+    s_bt.add_argument("--start-date", default="", help="K线开始日期，默认自动回看")
+    s_bt.add_argument("--end-date", default="", help="K线结束日期，默认今天 YYYY-MM-DD")
+    s_bt.add_argument("--force", action="store_true", help="强制重新同步K线")
+    s_bt.add_argument("--param-market", default="", help="参数市场，默认按股票代码推断")
     s_bt.add_argument("--param-scope", default="*", help="参数作用域，默认 *")
 
     s_sp = sub.add_parser("sync-prices", help="自动拉取实时行情并回写当前市价")
     s_sp.add_argument("--dry-run", action="store_true", help="仅拉取并输出统计，不写入Notion")
     s_sp.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
+
+    s_sk = sub.add_parser("sync-kline", help="同步日线K线到本地SQLite缓存")
+    s_sk.add_argument("--start-date", default="", help="开始日期，默认自动回看")
+    s_sk.add_argument("--end-date", default="", help="结束日期，默认今天 YYYY-MM-DD")
+    s_sk.add_argument("--symbols", default="", help="逗号分隔股票代码，如 600519,000001")
+    s_sk.add_argument("--adj", choices=["raw", "qfq", "hfq"], default=os.getenv("KLINE_DEFAULT_ADJ", "raw"), help="K线复权口径")
+    s_sk.add_argument("--force", action="store_true", help="强制覆盖缓存")
 
     s_sd = sub.add_parser("snapshot-daily", help="生成并落库每日策略快照")
     s_sd.add_argument("--dry-run", action="store_true", help="仅预览，不写入SQLite")
@@ -2266,6 +3486,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_sd.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_sd.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
     s_sd.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
+    s_sd.add_argument("--data-source", choices=["kline", "trade"], default="kline", help="快照输入数据源，默认 kline")
+    s_sd.add_argument("--adj", choices=["raw", "qfq", "hfq"], default=os.getenv("KLINE_DEFAULT_ADJ", "raw"), help="K线复权口径")
+    s_sd.add_argument("--start-date", default="", help="K线开始日期，默认自动回看")
+    s_sd.add_argument("--end-date", default="", help="K线结束日期，默认今天 YYYY-MM-DD")
+    s_sd.add_argument("--force", action="store_true", help="强制重新同步K线")
     s_sd.add_argument("--refresh-prices", action="store_true", help="先同步实时价格再快照")
     s_sd.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
     s_sd.add_argument("--param-market", default="", help="参数市场，默认按股票代码推断")
@@ -2366,6 +3591,8 @@ def main() -> int:
         return backtest_recommendation(client, cfg, args)
     if args.cmd == "sync-prices":
         return sync_prices(client, cfg, args)
+    if args.cmd == "sync-kline":
+        return sync_kline(client, cfg, args)
     if args.cmd == "snapshot-daily":
         return snapshot_daily(client, cfg, args)
     if args.cmd == "sync-snapshot-notion":

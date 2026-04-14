@@ -70,9 +70,16 @@ python src\stock_pipeline.py recommend-prices --refresh-prices --min-confidence 
 # 10) Backtest recommendation model
 python src\stock_pipeline.py backtest-recommendation --window 60 --min-confidence MEDIUM
 
+# 10.1) Sync daily K-line cache (Tushare Pro)
+python src\stock_pipeline.py sync-kline --start-date 2026-01-01 --end-date 2026-04-14 --adj raw
+
 # 11) Run parallel strategies (BASELINE + CHAN + ATR_WAVE)
-python src\stock_pipeline.py recommend-prices --dry-run --strategy-set baseline,chan,atr_wave
-python src\stock_pipeline.py backtest-recommendation --window 60 --strategy-set baseline,chan,atr_wave
+python src\stock_pipeline.py recommend-prices --dry-run --data-source kline --strategy-set baseline,chan,atr_wave
+python src\stock_pipeline.py backtest-recommendation --window 60 --data-source kline --strategy-set baseline,chan,atr_wave
+
+# 11.1) Compatibility mode (legacy trade-record input)
+python src\stock_pipeline.py recommend-prices --dry-run --data-source trade --strategy-set baseline,chan,atr_wave
+python src\stock_pipeline.py backtest-recommendation --window 60 --data-source trade --strategy-set baseline,chan,atr_wave
 
 # 12) Emit daily snapshot to local SQLite
 python src\stock_pipeline.py snapshot-daily --snapshot-date 2026-04-14
@@ -127,6 +134,23 @@ Override by setting env vars in `.env`:
 - `DB_STRATEGY_SNAPSHOT_ID`
 - `SQLITE_PATH` (default: `./data/strategy_snapshots.db`)
 - `SNAPSHOT_MARKET_RULE` (optional, e.g. `60:SH,00:SZ,30:SZ`)
+- `TUSHARE_TOKEN` (required for `kline` mode)
+- `KLINE_DEFAULT_ADJ` (`raw`/`qfq`/`hfq`, default: `raw`)
+- `DB_CASH_CONFIG_ID` (独立现金配置库 database id，必填)
+- `CASH_FIELD_NAME` (default: `可流动现金`)
+- `TOTAL_CASH_FALLBACK` (可选，仅排障兜底)
+- `CASH_TOTAL_ASSET_FIELD_NAME` (default: `总资产`)
+- `CASH_MARKET_VALUE_FIELD_NAME` (default: `总持仓市值`)
+- `CASH_UNREALIZED_FIELD_NAME` (default: `总浮动盈亏`)
+- `CASH_REALIZED_FIELD_NAME` (default: `已实现盈亏`)
+- `CASH_TOTAL_PNL_FIELD_NAME` (default: `总盈亏`)
+- `CASH_RECONCILE_THRESHOLD` (default: `1.0`，代码结果与Notion公式偏差阈值)
+- `DB_ACCOUNT_CONFIG_ID` / `TOTAL_CAPITAL_FALLBACK` (legacy 兼容，不建议新配置)
+
+现金字段说明：
+- 系统仅从 `DB_CASH_CONFIG_ID` 指向的独立数据库首行读取现金值。
+- 股票主档中的 `可流动现金` 不再作为现金来源。
+- 推荐输出会读取现金库里的汇总/公式字段并做对账，Dashboard 会显示偏差提示。
 
 ## 2) Commands
 
