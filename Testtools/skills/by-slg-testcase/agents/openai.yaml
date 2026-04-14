@@ -1,0 +1,4 @@
+interface:
+  display_name: "BY SLG Testcase"
+  short_description: "Generate structured SLG test cases from requirements"
+  default_prompt: "Use $by-slg-testcase to analyze the provided SLG requirement artifacts, identify confirmed rules and gaps, and generate structured Chinese test cases with risk coverage."

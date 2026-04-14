@@ -1,0 +1,156 @@
+{
+    "requirements":  [
+                         {
+                             "requirement_id":  "REQ-001",
+                             "source_text":  "配合探险车收取物资与“尸潮将至”日常高射玩法，塑造紧张的末日丧尸围城氛围",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-002",
+                             "source_text":  "英雄小队防守-程序动画激活条件： | 1.剧情动画探险车出现播放完后激活",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-003",
+                             "source_text":  "2.已建立第一小队",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-004",
+                             "source_text":  "专属丧尸刷新点：四个小队，每个小队都会在正前方地图区域拥有专属丧尸刷新点（数量暂定每只小队有30个刷新点）",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-005",
+                             "source_text":  "小队表演独立计算：每个小队里的英雄数量≥2，将在专属刷新点刷新丧尸，开启英雄小队防守表演。执行防守表演的英雄数量最高为4个小队*5=20人",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-006",
+                             "source_text":  "每只小队的丧尸刷新数量：与本小队上阵英雄数量有关，当小队英雄=2人时，将刷新3只丧尸，每增加1名英雄将增加3只，满员5人小队将刷新12只丧尸",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-007",
+                             "source_text":  "丧尸出生刷新方案1：（LW）从小队前方场地刷新点的土地里爬出来",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-008",
+                             "source_text":  "丧尸出生刷新方案2：从远处的迷雾里刷新，走出迷雾进入战场",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-009",
+                             "source_text":  "丧尸刷新规则1：丧尸数量将始终匹配英雄数量刷新对应数量的丧尸，当丧尸死亡后1秒会进行刷新",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-010",
+                             "source_text":  "丧尸刷新规则2：刷新机制遵循错落刷新原则，每个小队的专属刷新点同时只会刷新一只丧尸，若是两只丧尸同时死亡，随机一只将延迟0.5秒后刷新",
+                             "category":  "non-functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-011",
+                             "source_text":  "丧尸刷新规则3：如果当前小队所属的丧尸未被消灭，玩家将小队中的英雄全部下阵，丧尸将不再刷新，但也不会消失，而是会继续执行自身设定的逻辑。当玩家下线后，该部分丧尸会做处理消失",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-012",
+                             "source_text":  "丧尸行动逻辑1：每个小队将设置（暂定12个）丧尸攻击坐标点，位置均匀平铺设置在小队所属的钢丝网工事、探险车",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-013",
+                             "source_text":  "丧尸行动逻辑2：从刷新点出生，播放出生动画并执行行走逻辑，播放行走动作向着距离最近的攻击坐标前进",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-014",
+                             "source_text":  "丧尸行动逻辑3：丧尸在行走的途中有个随机时间点(2-10秒)触触发奔跑逻辑，播放奔跑动作跑向目标坐标点，增加丧尸的动态变化",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-015",
+                             "source_text":  "丧尸行动逻辑4：若丧尸活着走到目标坐标点，将立即死亡",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-016",
+                             "source_text":  "丧尸行动逻辑5：若被英雄攻击3次，丧尸将会死亡，播放死亡动画",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-017",
+                             "source_text":  "丧尸行动逻辑6：丧尸死亡后，将会有50%概率掉落物资木头、食物、银币中的1-3种，物资分散掉落，不会重叠",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-018",
+                             "source_text":  "丧尸行动逻辑7：物资掉落1秒后，播放物资飘飞特效，飞向探险车车厢位置",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-019",
+                             "source_text":  "英雄攻击逻辑1：所有英雄都将在小队编队中进行远程攻击，攻击距离覆盖整个丧尸刷新点（选用方案2则会攻击走出迷雾的丧尸）",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-020",
+                             "source_text":  "英雄攻击逻辑2：英雄攻击将播放自身普攻特效，攻击类型分为有弹道，与无弹道",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-021",
+                             "source_text":  "英雄攻击逻辑3：每个英雄攻击频率将独立计算，在3-7秒的区间值内随机攻击",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-022",
+                             "source_text":  "丧尸出生刷新方案1 | 丧尸出生刷新方案2",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-023",
+                             "source_text":  "1 | 特效 | 物资掉落特效 | 丧尸被击杀后掉落物资的特效",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         },
+                         {
+                             "requirement_id":  "REQ-024",
+                             "source_text":  "2 | 特效 | 探险车收取物资特效 | 物资掉落1秒后，播放物资飘飞特效，飞向探险车车厢位置探险车收取特效",
+                             "category":  "functional",
+                             "source_file":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                         }
+                     ],
+    "metadata":  {
+                     "input":  "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx",
+                     "source_files":  [
+                                          "E:\\BM\\plan\\策划文档\\正式文档\\V0.3\\系统和杂项\\英雄小队的防守表演.xlsx"
+                                      ],
+                     "count":  24,
+                     "mode":  "focus-filter"
+                 }
+}

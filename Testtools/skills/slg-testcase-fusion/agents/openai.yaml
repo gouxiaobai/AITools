@@ -1,0 +1,4 @@
+interface:
+  display_name: "SLG Testcase Fusion"
+  short_description: "Fuse requirement ingestion with SLG-focused testcase output"
+  default_prompt: "Use $slg-testcase-fusion to convert the provided SLG requirement artifacts into BM-import-friendly Chinese test cases, using multi-format ingestion as preprocessing and SLG output rules as the final authority."
