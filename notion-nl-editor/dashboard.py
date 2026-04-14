@@ -24,6 +24,7 @@ from stock_pipeline import (  # noqa: E402
     param_apply,
     param_diff,
     param_draft_save,
+    param_monitor,
     param_recommend,
     param_rollback,
     recommend_prices,
@@ -190,8 +191,8 @@ def main() -> None:
         st.stop()
 
     _show_run_status()
-    tab_price, tab_signal, tab_backtest, tab_history, tab_param = st.tabs(
-        ["实时行情", "交易建议", "回测分析", "历史追踪", "参数调优"]
+    tab_price, tab_signal, tab_backtest, tab_history, tab_param, tab_health = st.tabs(
+        ["实时行情", "交易建议", "回测分析", "历史追踪", "参数调优", "系统健康"]
     )
 
     with tab_price:
@@ -429,6 +430,15 @@ def main() -> None:
                         c1.metric("将修改项", int(r_parsed.get("changed_count", 0)))
                         c2.metric("影响策略", 1)
                         c3.metric("高风险项", int(r_parsed.get("high_risk_count", 0)))
+                        v = r_parsed.get("validation", {}) if isinstance(r_parsed.get("validation", {}), dict) else {}
+                        c4, c5, c6 = st.columns(3)
+                        c4.metric("稳定性", f"{float(v.get('stability', 0.0)):.3f}")
+                        c5.metric("成本(bps)", f"{float(v.get('cost_bps', 0.0)):.1f}")
+                        c6.metric("滑点(bps)", f"{float(v.get('slippage_bps', 0.0)):.1f}")
+
+                        rel1, rel2 = st.columns(2)
+                        rollout_scope = rel1.text_input("灰度范围", value="full", key="param_rollout_scope")
+                        batch_id = rel2.text_input("发布批次ID", value=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}", key="param_batch_id")
                         confirm_apply = st.checkbox("我确认应用以上参数变更", value=False, key="param_confirm_apply")
                         ap1, ap2 = st.columns(2)
                         if ap1.button("应用参数", type="primary", use_container_width=True, disabled=not confirm_apply):
@@ -438,6 +448,8 @@ def main() -> None:
                                 expected_version=int(r_parsed.get("current_version", -1)),
                                 operator=os.getenv("OPERATOR", "local_user"),
                                 comment="dashboard_apply",
+                                batch_id=batch_id,
+                                rollout_scope=rollout_scope,
                             )
                             a_code, a_raw, a_parsed, a_err = _run_and_capture(param_apply, apply_args)
                             if a_err or a_code != 0:
@@ -467,6 +479,36 @@ def main() -> None:
                                 _mark_run("参数回滚", True, "参数已回滚")
                                 st.session_state["param_last_apply"] = rb_parsed
                                 _show_json_debug("参数回滚结果", rb_raw)
+
+    with tab_health:
+        st.subheader("系统健康")
+        days = st.number_input("统计窗口（天）", min_value=1, max_value=30, value=7, step=1)
+        if st.button("刷新健康指标", type="primary", use_container_width=True):
+            mon_args = argparse.Namespace(days=int(days))
+            code, raw, parsed, run_err = _run_and_capture(param_monitor, mon_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "健康指标刷新失败"
+                st.error(msg)
+                _mark_run("系统健康", False, msg)
+            else:
+                st.success("健康指标刷新完成")
+                _mark_run("系统健康", True, "健康指标已更新")
+                if isinstance(parsed, dict):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("事件总数", int(parsed.get("event_total", 0)))
+                    c2.metric("成功率", f"{float(parsed.get('success_rate', 0.0)):.2%}")
+                    c3.metric("失败数", int(parsed.get("event_failed", 0)))
+                    c4.metric("平均耗时(ms)", f"{float(parsed.get('avg_duration_ms', 0.0)):.1f}")
+                    apply_stat = parsed.get("apply_stat", {})
+                    if isinstance(apply_stat, dict) and apply_stat:
+                        st.subheader("参数发布状态")
+                        stat_df = pd.DataFrame([{"status": k, "count": v} for k, v in apply_stat.items()])
+                        st.dataframe(stat_df, use_container_width=True, hide_index=True)
+                    failures = parsed.get("recent_failures", [])
+                    if isinstance(failures, list) and failures:
+                        st.subheader("最近失败任务")
+                        st.dataframe(pd.DataFrame(failures), use_container_width=True, hide_index=True)
+                _show_json_debug("系统健康结果", raw)
 
     st.markdown("---")
     st.caption("建议：先同步实时行情，再生成建议，最后做快照与历史查询。")

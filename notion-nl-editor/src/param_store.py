@@ -1,3 +1,4 @@
+﻿
 import datetime as dt
 import hashlib
 import json
@@ -6,20 +7,23 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+SCHEMA_VERSION = 2
 
 PARAM_SCHEMA: Dict[str, Dict[str, Any]] = {
     "band_low": {"type": "number", "min": 0.005, "max": 0.2, "step": 0.001},
     "band_high": {"type": "number", "min": 0.01, "max": 0.3, "step": 0.001},
     "stop_mult": {"type": "number", "min": 1.0, "max": 3.0, "step": 0.1},
+    "trend_threshold": {"type": "number", "min": 0.005, "max": 0.08, "step": 0.001},
+    "vol_cap": {"type": "number", "min": 0.02, "max": 0.3, "step": 0.01},
+    "rr_min": {"type": "number", "min": 0.3, "max": 2.0, "step": 0.05},
     "min_confidence": {"type": "enum", "choices": ["LOW", "MEDIUM", "HIGH"]},
     "allow_small_sample": {"type": "bool"},
 }
 
-
 DEFAULT_PARAM_VALUES: Dict[str, Dict[str, Any]] = {
-    "BASELINE": {"band_low": 0.01, "band_high": 0.03, "stop_mult": 1.8, "min_confidence": "MEDIUM", "allow_small_sample": True},
-    "CHAN": {"band_low": 0.008, "band_high": 0.025, "stop_mult": 1.6, "min_confidence": "MEDIUM", "allow_small_sample": True},
-    "ATR_WAVE": {"band_low": 0.012, "band_high": 0.035, "stop_mult": 2.2, "min_confidence": "MEDIUM", "allow_small_sample": True},
+    "BASELINE": {"band_low": 0.01, "band_high": 0.03, "stop_mult": 1.8, "trend_threshold": 0.015, "vol_cap": 0.10, "rr_min": 0.8, "min_confidence": "MEDIUM", "allow_small_sample": True},
+    "CHAN": {"band_low": 0.008, "band_high": 0.025, "stop_mult": 1.6, "trend_threshold": 0.012, "vol_cap": 0.12, "rr_min": 0.75, "min_confidence": "MEDIUM", "allow_small_sample": True},
+    "ATR_WAVE": {"band_low": 0.012, "band_high": 0.035, "stop_mult": 2.2, "trend_threshold": 0.018, "vol_cap": 0.14, "rr_min": 0.9, "min_confidence": "MEDIUM", "allow_small_sample": True},
 }
 
 
@@ -41,8 +45,7 @@ def _coerce_bool(v: Any) -> bool:
         return v
     if isinstance(v, (int, float)):
         return bool(v)
-    s = str(v).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _validate_param_value(name: str, value: Any) -> Tuple[bool, str, Any]:
@@ -87,7 +90,6 @@ def validate_param_payload(payload: Dict[str, Any]) -> Tuple[bool, List[str], Di
             normalized[k] = v
     return len(errors) == 0, errors, normalized
 
-
 class ParamStore:
     def __init__(self, sqlite_path: str) -> None:
         self.sqlite_path = os.path.abspath(sqlite_path)
@@ -101,88 +103,153 @@ class ParamStore:
     def close(self) -> None:
         self.conn.close()
 
+    def _table_exists(self, table: str) -> bool:
+        row = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        return bool(row)
+
+    def _column_exists(self, table: str, col: str) -> bool:
+        if not self._table_exists(table):
+            return False
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == col for r in rows)
+
+    def _ensure_column(self, table: str, col: str, ddl: str) -> None:
+        if not self._column_exists(table, col):
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
     def _init_schema(self) -> None:
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS strategy_param_set (
-                strategy_id TEXT NOT NULL,
-                market TEXT NOT NULL,
-                symbol_scope TEXT NOT NULL,
-                params_json TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (strategy_id, market, symbol_scope)
-            )
-            """
-        )
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS strategy_param_proposal (
-                proposal_id TEXT PRIMARY KEY,
-                strategy_id TEXT NOT NULL,
-                market TEXT NOT NULL,
-                symbol_scope TEXT NOT NULL,
-                base_version INTEGER NOT NULL,
-                current_params_json TEXT NOT NULL,
-                proposed_params_json TEXT NOT NULL,
-                score REAL NOT NULL,
-                source_start_date TEXT NOT NULL,
-                source_end_date TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS strategy_param_apply_log (
-                apply_log_id TEXT PRIMARY KEY,
-                proposal_id TEXT NOT NULL,
-                strategy_id TEXT NOT NULL,
-                market TEXT NOT NULL,
-                symbol_scope TEXT NOT NULL,
-                old_params_json TEXT NOT NULL,
-                new_params_json TEXT NOT NULL,
-                operator TEXT NOT NULL,
-                comment TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                changed_count INTEGER NOT NULL,
-                skipped_count INTEGER NOT NULL,
-                warnings_json TEXT NOT NULL,
-                rollback_ref TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS strategy_param_draft (
-                draft_id TEXT PRIMARY KEY,
-                proposal_id TEXT NOT NULL,
-                strategy_id TEXT NOT NULL,
-                market TEXT NOT NULL,
-                symbol_scope TEXT NOT NULL,
-                editor_values_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = self.conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
+        current = int(row["value"]) if row else 0
+
+        if current < 1:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_param_set (
+                    strategy_id TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol_scope TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (strategy_id, market, symbol_scope)
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_param_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol_scope TEXT NOT NULL,
+                    base_version INTEGER NOT NULL,
+                    current_params_json TEXT NOT NULL,
+                    proposed_params_json TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    source_start_date TEXT NOT NULL,
+                    source_end_date TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_param_apply_log (
+                    apply_log_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol_scope TEXT NOT NULL,
+                    old_params_json TEXT NOT NULL,
+                    new_params_json TEXT NOT NULL,
+                    operator TEXT NOT NULL,
+                    comment TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    changed_count INTEGER NOT NULL,
+                    skipped_count INTEGER NOT NULL,
+                    warnings_json TEXT NOT NULL,
+                    rollback_ref TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_param_draft (
+                    draft_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol_scope TEXT NOT NULL,
+                    editor_values_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            current = 1
+
+        if current < 2:
+            self._ensure_column("strategy_param_proposal", "validation_json", "TEXT NOT NULL DEFAULT '{}' ")
+            self._ensure_column("strategy_param_apply_log", "batch_id", "TEXT")
+            self._ensure_column("strategy_param_apply_log", "rollout_scope", "TEXT")
+            self._ensure_column("strategy_param_apply_log", "status", "TEXT NOT NULL DEFAULT 'APPLIED'")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_run_event (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    module TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    proposal_id TEXT,
+                    apply_log_id TEXT,
+                    error_code TEXT,
+                    error_msg TEXT,
+                    meta_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            current = 2
+
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_proposal ON strategy_param_apply_log (proposal_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_hash ON strategy_param_apply_log (proposal_id, payload_hash)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_proposal_created ON strategy_param_proposal (created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_run_event_created ON strategy_run_event (created_at DESC)")
+        self.conn.execute("INSERT INTO _meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(current),))
         self.conn.commit()
+
+    def get_schema_version(self) -> int:
+        row = self.conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
+        return int(row["value"]) if row else 0
+
+    def log_event(self, module: str, action: str, status: str, duration_ms: int, meta: Optional[Dict[str, Any]] = None, run_id: str = "", proposal_id: str = "", apply_log_id: str = "", error_code: str = "", error_msg: str = "") -> str:
+        event_id = uuid4().hex[:12]
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_run_event(event_id, run_id, module, action, status, duration_ms, proposal_id, apply_log_id, error_code, error_msg, meta_json, created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event_id,
+                    run_id or None,
+                    module,
+                    action,
+                    status,
+                    int(duration_ms),
+                    proposal_id or None,
+                    apply_log_id or None,
+                    error_code or None,
+                    error_msg or None,
+                    json.dumps(meta or {}, ensure_ascii=False, sort_keys=True),
+                    _now(),
+                ),
+            )
+        return event_id
 
     def _load_param_set(self, strategy_id: str, market: str, symbol_scope: str) -> Tuple[Dict[str, Any], int]:
         cur = self.conn.execute(
-            """
-            SELECT params_json, version FROM strategy_param_set
-            WHERE strategy_id=? AND market=? AND symbol_scope=?
-            """,
+            "SELECT params_json, version FROM strategy_param_set WHERE strategy_id=? AND market=? AND symbol_scope=?",
             (_norm_strategy(strategy_id), market.upper(), symbol_scope),
         ).fetchone()
         if not cur:
             defaults = DEFAULT_PARAM_VALUES.get(_norm_strategy(strategy_id), DEFAULT_PARAM_VALUES["BASELINE"]).copy()
-            return defaults, 0
+            ok, _, normalized = validate_param_payload(defaults)
+            return (normalized if ok else defaults), 0
         return json.loads(cur["params_json"]), int(cur["version"])
 
     def _save_param_set(self, strategy_id: str, market: str, symbol_scope: str, payload: Dict[str, Any], version: int) -> None:
@@ -198,38 +265,56 @@ class ParamStore:
             (_norm_strategy(strategy_id), market.upper(), symbol_scope, json.dumps(payload, ensure_ascii=False, sort_keys=True), version, _now()),
         )
 
-    def create_proposals_from_history(
-        self,
-        snapshot_rows: List[Dict[str, Any]],
-        source_start_date: str,
-        source_end_date: str,
-        run_id: str,
-        symbol_scope: str = "*",
-        dry_run: bool = False,
-    ) -> List[Dict[str, Any]]:
+    def get_active_param_set(self, strategy_id: str, market: str, symbol_scope: str = "*") -> Dict[str, Any]:
+        params, version = self._load_param_set(strategy_id, market, symbol_scope)
+        return {"strategy_id": _norm_strategy(strategy_id), "market": market.upper(), "symbol_scope": symbol_scope, "params": params, "version": version}
+
+    def create_proposals_from_history(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0) -> List[Dict[str, Any]]:
         buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for row in snapshot_rows:
             key = (_norm_strategy(str(row.get("strategy_id", ""))), str(row.get("market", "OTHER")).upper())
             buckets.setdefault(key, []).append(row)
 
         out: List[Dict[str, Any]] = []
+        cost_ret = (float(cost_bps) + float(slippage_bps)) / 10000.0
         for (strategy_id, market), items in sorted(buckets.items()):
-            returns = [float(x.get("ret_1d", 0.0) or 0.0) for x in items]
-            hit_rate = (sum(float(x.get("hit_flag", 0) or 0) for x in items) / len(items)) if items else 0.0
-            mean_ret = (sum(returns) / len(returns)) if returns else 0.0
-            dd_mean = (sum(float(x.get("max_drawdown", 0.0) or 0.0) for x in items) / len(items)) if items else 0.0
-            score = mean_ret * 100.0 + hit_rate * 10.0 - dd_mean * 50.0
+            returns = [float(x.get("ret_1d", 0.0) or 0.0) - cost_ret for x in items]
+            n = len(returns)
+            if n == 0:
+                continue
+            hit_rate = sum(float(x.get("hit_flag", 0) or 0) for x in items) / n
+            mean_ret = sum(returns) / n
+            dd_mean = sum(float(x.get("max_drawdown", 0.0) or 0.0) for x in items) / n
+
+            chunk = max(1, n // max(1, int(walk_forward_splits)))
+            wf_scores: List[float] = []
+            for i in range(0, n, chunk):
+                w = returns[i : i + chunk]
+                if w:
+                    wf_scores.append(sum(w) / len(w))
+            stability = 1.0 - min(1.0, (max(wf_scores) - min(wf_scores)) / (abs(mean_ret) + 1e-6)) if wf_scores else 0.0
+            score = mean_ret * 100.0 + hit_rate * 10.0 - dd_mean * 50.0 + stability * 2.0
 
             current_params, base_version = self._load_param_set(strategy_id, market, symbol_scope)
             proposed = dict(current_params)
             proposed["band_low"] = round(max(0.005, min(0.2, float(proposed.get("band_low", 0.01)) + (0.002 if hit_rate < 0.48 else -0.001))), 3)
             proposed["band_high"] = round(max(0.01, min(0.3, float(proposed.get("band_high", 0.03)) + (0.002 if mean_ret > 0 else -0.002))), 3)
             proposed["stop_mult"] = round(max(1.0, min(3.0, float(proposed.get("stop_mult", 1.8)) + (0.2 if dd_mean > 0.08 else -0.1))), 1)
+            proposed["trend_threshold"] = round(max(0.005, min(0.08, float(proposed.get("trend_threshold", 0.015)) + (0.002 if stability < 0.6 else -0.001))), 3)
+            proposed["vol_cap"] = round(max(0.02, min(0.3, float(proposed.get("vol_cap", 0.10)) + (0.01 if dd_mean > 0.08 else -0.01))), 2)
+            proposed["rr_min"] = round(max(0.3, min(2.0, float(proposed.get("rr_min", 0.8)) + (0.05 if mean_ret < 0 else -0.05))), 2)
             proposed["min_confidence"] = "HIGH" if hit_rate < 0.45 else ("MEDIUM" if hit_rate < 0.60 else "LOW")
             proposed["allow_small_sample"] = True if mean_ret > 0.0 else False
             _, _, proposed = validate_param_payload(proposed)
 
             proposal_id = uuid4().hex[:12]
+            validation = {
+                "walk_forward_splits": int(walk_forward_splits),
+                "cost_bps": float(cost_bps),
+                "slippage_bps": float(slippage_bps),
+                "stability": round(stability, 6),
+                "wf_scores": [round(x, 6) for x in wf_scores],
+            }
             row = {
                 "proposal_id": proposal_id,
                 "strategy_id": strategy_id,
@@ -247,6 +332,7 @@ class ParamStore:
                 "hit_rate": round(hit_rate, 6),
                 "mean_ret": round(mean_ret, 6),
                 "dd_mean": round(dd_mean, 6),
+                "validation": validation,
             }
             out.append(row)
 
@@ -258,33 +344,21 @@ class ParamStore:
                         INSERT INTO strategy_param_proposal(
                             proposal_id, strategy_id, market, symbol_scope, base_version,
                             current_params_json, proposed_params_json, score,
-                            source_start_date, source_end_date, run_id, created_at
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                            source_start_date, source_end_date, run_id, created_at, validation_json
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
-                            row["proposal_id"],
-                            row["strategy_id"],
-                            row["market"],
-                            row["symbol_scope"],
-                            row["base_version"],
+                            row["proposal_id"], row["strategy_id"], row["market"], row["symbol_scope"], row["base_version"],
                             json.dumps(row["current_params"], ensure_ascii=False, sort_keys=True),
                             json.dumps(row["proposed_params"], ensure_ascii=False, sort_keys=True),
-                            row["score"],
-                            row["source_start_date"],
-                            row["source_end_date"],
-                            row["run_id"],
-                            row["created_at"],
+                            row["score"], row["source_start_date"], row["source_end_date"], row["run_id"], row["created_at"],
+                            json.dumps(row["validation"], ensure_ascii=False, sort_keys=True),
                         ),
                     )
         return out
 
     def get_proposal(self, proposal_id: str) -> Dict[str, Any]:
-        row = self.conn.execute(
-            """
-            SELECT * FROM strategy_param_proposal WHERE proposal_id=?
-            """,
-            (proposal_id,),
-        ).fetchone()
+        row = self.conn.execute("SELECT * FROM strategy_param_proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
         if not row:
             raise RuntimeError(f"proposal not found: {proposal_id}")
         return {
@@ -300,39 +374,27 @@ class ParamStore:
             "source_end_date": row["source_end_date"],
             "run_id": row["run_id"],
             "created_at": row["created_at"],
+            "validation": json.loads(row["validation_json"] or "{}"),
         }
 
     def save_draft(self, proposal_id: str, editor_values: Dict[str, Any]) -> Dict[str, Any]:
         proposal = self.get_proposal(proposal_id)
         draft_id = f"{proposal_id}:{proposal['strategy_id']}:{proposal['market']}:{proposal['symbol_scope']}"
+        now = _now()
         with self.conn:
             self.conn.execute(
                 """
                 INSERT INTO strategy_param_draft(draft_id, proposal_id, strategy_id, market, symbol_scope, editor_values_json, updated_at)
                 VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(draft_id) DO UPDATE SET
-                    editor_values_json=excluded.editor_values_json,
-                    updated_at=excluded.updated_at
+                ON CONFLICT(draft_id) DO UPDATE SET editor_values_json=excluded.editor_values_json, updated_at=excluded.updated_at
                 """,
-                (
-                    draft_id,
-                    proposal_id,
-                    proposal["strategy_id"],
-                    proposal["market"],
-                    proposal["symbol_scope"],
-                    json.dumps(editor_values, ensure_ascii=False, sort_keys=True),
-                    _now(),
-                ),
+                (draft_id, proposal_id, proposal["strategy_id"], proposal["market"], proposal["symbol_scope"], json.dumps(editor_values, ensure_ascii=False, sort_keys=True), now),
             )
-        return {"draft_id": draft_id, "updated_at": _now()}
+        return {"draft_id": draft_id, "updated_at": now}
 
     def load_draft(self, proposal_id: str) -> Dict[str, Any]:
         row = self.conn.execute(
-            """
-            SELECT editor_values_json, updated_at FROM strategy_param_draft
-            WHERE proposal_id=?
-            ORDER BY updated_at DESC LIMIT 1
-            """,
+            "SELECT editor_values_json, updated_at FROM strategy_param_draft WHERE proposal_id=? ORDER BY updated_at DESC LIMIT 1",
             (proposal_id,),
         ).fetchone()
         if not row:
@@ -351,7 +413,6 @@ class ParamStore:
         warnings: List[str] = []
         changed_count = 0
         high_risk_count = 0
-
         for name in PARAM_SCHEMA.keys():
             curr = current_params.get(name)
             rec = proposed.get(name)
@@ -373,20 +434,7 @@ class ParamStore:
             changed = curr != yours
             if changed:
                 changed_count += 1
-            rows.append(
-                {
-                    "param_name": name,
-                    "current_value": curr,
-                    "recommended_value": rec,
-                    "your_value": yours,
-                    "delta_pct": round(delta_pct, 6),
-                    "risk": risk,
-                    "valid": bool(valid),
-                    "error": err,
-                    "changed": changed,
-                    "spec": PARAM_SCHEMA[name],
-                }
-            )
+            rows.append({"param_name": name, "current_value": curr, "recommended_value": rec, "your_value": yours, "delta_pct": round(delta_pct, 6), "risk": risk, "valid": bool(valid), "error": err, "changed": changed, "spec": PARAM_SCHEMA[name]})
 
         return {
             "proposal_id": proposal_id,
@@ -400,16 +448,10 @@ class ParamStore:
             "skipped_count": max(0, len(rows) - changed_count),
             "high_risk_count": high_risk_count,
             "warnings": sorted(list(set(warnings))),
+            "validation": proposal.get("validation", {}),
         }
 
-    def apply(
-        self,
-        proposal_id: str,
-        editor_values: Optional[Dict[str, Any]] = None,
-        operator: str = "local_user",
-        comment: str = "",
-        expected_version: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    def apply(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "full") -> Dict[str, Any]:
         diff = self.diff(proposal_id, editor_values=editor_values or {})
         if diff["warnings"]:
             raise RuntimeError(f"validation failed: {'; '.join(diff['warnings'])}")
@@ -431,19 +473,10 @@ class ParamStore:
             (proposal_id, ph),
         ).fetchone()
         if existing:
-            return {
-                "apply_log_id": existing["apply_log_id"],
-                "changed_count": 0,
-                "skipped_count": len(PARAM_SCHEMA),
-                "warnings": ["idempotent replay"],
-                "idempotent": True,
-                "version": current_version,
-            }
+            return {"apply_log_id": existing["apply_log_id"], "changed_count": 0, "skipped_count": len(PARAM_SCHEMA), "warnings": ["idempotent replay"], "idempotent": True, "version": current_version, "batch_id": batch_id, "rollout_scope": rollout_scope}
 
         changed_count = sum(1 for k in PARAM_SCHEMA.keys() if current_params.get(k) != final_payload.get(k))
         skipped_count = len(PARAM_SCHEMA) - changed_count
-        warnings: List[str] = []
-
         apply_log_id = uuid4().hex[:12]
         new_version = current_version + 1
         with self.conn:
@@ -453,8 +486,9 @@ class ParamStore:
                 INSERT INTO strategy_param_apply_log(
                     apply_log_id, proposal_id, strategy_id, market, symbol_scope,
                     old_params_json, new_params_json, operator, comment, payload_hash,
-                    changed_count, skipped_count, warnings_json, rollback_ref, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    changed_count, skipped_count, warnings_json, rollback_ref, created_at,
+                    batch_id, rollout_scope, status
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     apply_log_id,
@@ -469,31 +503,20 @@ class ParamStore:
                     ph,
                     changed_count,
                     skipped_count,
-                    json.dumps(warnings, ensure_ascii=False),
+                    json.dumps([], ensure_ascii=False),
                     None,
                     _now(),
+                    batch_id or None,
+                    rollout_scope,
+                    "APPLIED",
                 ),
             )
-
-        return {
-            "apply_log_id": apply_log_id,
-            "changed_count": changed_count,
-            "skipped_count": skipped_count,
-            "warnings": warnings,
-            "idempotent": False,
-            "version": new_version,
-        }
+        return {"apply_log_id": apply_log_id, "changed_count": changed_count, "skipped_count": skipped_count, "warnings": [], "idempotent": False, "version": new_version, "batch_id": batch_id, "rollout_scope": rollout_scope}
 
     def rollback(self, apply_log_id: str, operator: str = "local_user", comment: str = "") -> Dict[str, Any]:
-        row = self.conn.execute(
-            """
-            SELECT * FROM strategy_param_apply_log WHERE apply_log_id=?
-            """,
-            (apply_log_id,),
-        ).fetchone()
+        row = self.conn.execute("SELECT * FROM strategy_param_apply_log WHERE apply_log_id=?", (apply_log_id,)).fetchone()
         if not row:
             raise RuntimeError(f"apply log not found: {apply_log_id}")
-
         strategy_id = row["strategy_id"]
         market = row["market"]
         symbol_scope = row["symbol_scope"]
@@ -510,8 +533,9 @@ class ParamStore:
                 INSERT INTO strategy_param_apply_log(
                     apply_log_id, proposal_id, strategy_id, market, symbol_scope,
                     old_params_json, new_params_json, operator, comment, payload_hash,
-                    changed_count, skipped_count, warnings_json, rollback_ref, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    changed_count, skipped_count, warnings_json, rollback_ref, created_at,
+                    batch_id, rollout_scope, status
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rollback_apply_id,
@@ -529,14 +553,44 @@ class ParamStore:
                     json.dumps([], ensure_ascii=False),
                     apply_log_id,
                     _now(),
+                    row["batch_id"],
+                    row["rollout_scope"],
+                    "ROLLED_BACK",
                 ),
             )
+        return {"apply_log_id": rollback_apply_id, "rollback_ref": apply_log_id, "changed_count": changed_count, "skipped_count": len(PARAM_SCHEMA) - changed_count, "warnings": [], "version": new_version}
 
+    def get_monitor(self, days: int = 7) -> Dict[str, Any]:
+        days = max(1, int(days))
+        cutoff = (dt.datetime.now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
+        ev = self.conn.execute(
+            "SELECT status, COUNT(*) AS cnt, AVG(duration_ms) AS avg_ms FROM strategy_run_event WHERE created_at >= ? GROUP BY status",
+            (cutoff,),
+        ).fetchall()
+        total = sum(int(r["cnt"]) for r in ev)
+        success = sum(int(r["cnt"]) for r in ev if r["status"] == "SUCCESS")
+        failed = sum(int(r["cnt"]) for r in ev if r["status"] == "FAILED")
+        avg_ms = 0.0
+        if total > 0:
+            avg_ms = sum((float(r["avg_ms"] or 0.0) * int(r["cnt"])) for r in ev) / total
+
+        recent_failures = self.conn.execute(
+            "SELECT module, action, error_code, error_msg, created_at FROM strategy_run_event WHERE created_at >= ? AND status='FAILED' ORDER BY created_at DESC LIMIT 20",
+            (cutoff,),
+        ).fetchall()
+        apply_rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM strategy_param_apply_log WHERE created_at >= ? GROUP BY status",
+            (cutoff,),
+        ).fetchall()
+        apply_stat = {r["status"]: int(r["cnt"]) for r in apply_rows}
         return {
-            "apply_log_id": rollback_apply_id,
-            "rollback_ref": apply_log_id,
-            "changed_count": changed_count,
-            "skipped_count": len(PARAM_SCHEMA) - changed_count,
-            "warnings": [],
-            "version": new_version,
+            "days": days,
+            "schema_version": self.get_schema_version(),
+            "event_total": total,
+            "event_success": success,
+            "event_failed": failed,
+            "success_rate": (float(success) / float(total)) if total > 0 else 0.0,
+            "avg_duration_ms": round(avg_ms, 2),
+            "apply_stat": apply_stat,
+            "recent_failures": [dict(x) for x in recent_failures],
         }

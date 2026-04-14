@@ -420,13 +420,15 @@ def audit(client: NotionClient, cfg: Cfg, as_json: bool) -> int:
         print(f"  Acceptance: {item['acceptance']}")
     return 0
 def stock_index(client: NotionClient, cfg: Cfg) -> Tuple[Dict[str, str], Dict[str, str]]:
+    stock_db = client.get_database(cfg.stock_master_id)
+    fields = _resolve_stock_fields_runtime(stock_db)
     rows = client.query_database_all(cfg.stock_master_id)
     by_name: Dict[str, str] = {}
     by_code: Dict[str, str] = {}
     for r in rows:
         pid = r.get("id")
-        name = p_title(r, "鑲＄エ")
-        code = p_rich(r, "鑲＄エ浠ｇ爜")
+        name = p_title(r, fields["title"]) if fields.get("title") else ""
+        code = _prop_text_any(r, fields["stock_code"]) if fields.get("stock_code") else ""
         if name and pid and name not in by_name:
             by_name[name] = pid
         if code and pid and code not in by_code:
@@ -579,62 +581,85 @@ def add_trade(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
     by_name, by_code = stock_index(client, cfg)
     stock_id = by_code.get(args.stock) or by_name.get(args.stock)
     if not stock_id:
-        raise ValueError(f"stock '{args.stock}' not found in 鑲＄エ涓绘。 title or 鑲＄エ浠ｇ爜")
+        raise ValueError(f"stock '{args.stock}' not found in stock master by title/code")
 
     title = f"{args.date} {args.direction} {args.stock} {args.shares}@{args.price}"
-    props: Dict[str, Any] = {
-        "璁板綍": title_prop(title),
-        "鏃ユ湡": {"date": {"start": args.date}},
-        "鏂瑰悜": {"select": {"name": args.direction}},
-        "鑲℃暟": {"number": float(args.shares)},
-        "浠锋牸": {"number": float(args.price)},
-        "手续费": {"number": float(args.fee)},
-        "绋庤垂": {"number": float(args.tax)},
-        "鑲＄エ": {"relation": [{"id": stock_id}]},
-        "source_table": {"select": {"name": "manual"}},
-        "import_status": {"select": {"name": "ready"}},
-    }
-    if args.strategy:
-        props["绛栫暐"] = {"select": {"name": args.strategy}}
-    if args.note:
-        props["澶囨敞"] = {"rich_text": [{"type": "text", "text": {"content": args.note[:2000]}}]}
+    trade_db = client.get_database(cfg.std_trades_id)
+    write_fields = _resolve_trade_write_fields(trade_db)
+    db_props = trade_db.get("properties", {})
+    props: Dict[str, Any] = {}
+
+    write_map = [
+        (write_fields.get("title"), title),
+        (write_fields.get("date"), args.date),
+        (write_fields.get("direction"), args.direction),
+        (write_fields.get("shares"), float(args.shares)),
+        (write_fields.get("price"), float(args.price)),
+        (write_fields.get("fee"), float(args.fee)),
+        (write_fields.get("tax"), float(args.tax)),
+        (write_fields.get("source_table"), "manual"),
+        (write_fields.get("import_status"), "ready"),
+    ]
+    for prop_name, value in write_map:
+        if not prop_name:
+            continue
+        payload = _write_prop_value(db_props, prop_name, value)
+        if payload is not None:
+            props[prop_name] = payload
+    if write_fields.get("stock"):
+        props[write_fields["stock"]] = {"relation": [{"id": stock_id}]}
+    if args.strategy and write_fields.get("strategy"):
+        payload = _write_prop_value(db_props, write_fields["strategy"], args.strategy)
+        if payload is not None:
+            props[write_fields["strategy"]] = payload
+    if args.note and write_fields.get("note"):
+        payload = _write_prop_value(db_props, write_fields["note"], args.note[:2000])
+        if payload is not None:
+            props[write_fields["note"]] = payload
 
     page = client.create_page(cfg.std_trades_id, props)
-    print(f"鏂板浜ゆ槗鎴愬姛: id={page.get('id')}")
+    print(f"新增交易成功: id={page.get('id')}")
     return 0
 
 
 def validate_manual_entries(client: NotionClient, cfg: Cfg) -> int:
+    trade_db = client.get_database(cfg.std_trades_id)
     rows = client.query_database_all(cfg.std_trades_id)
-    required = ["鏃ユ湡", "鏂瑰悜", "鑲℃暟", "浠锋牸", "鑲＄エ", "璁板綍"]
+    fields = _resolve_trade_write_fields(trade_db)
     failures: List[Tuple[str, List[str]]] = []
     checked = 0
 
     for r in rows:
-        source = p_select(r, "source_table")
+        source_field = fields.get("source_table")
+        source = p_select(r, source_field) if source_field else ""
         if source and source != "manual":
             continue
         checked += 1
         missing: List[str] = []
-        if not p_date(r, "鏃ユ湡"):
-            missing.append("鏃ユ湡")
-        if p_select(r, "鏂瑰悜") not in {"BUY", "SELL"}:
-            missing.append("鏂瑰悜")
-        if p_number(r, "鑲℃暟") is None:
-            missing.append("鑲℃暟")
-        if p_number(r, "浠锋牸") is None:
-            missing.append("浠锋牸")
-        if len(p_relation_ids(r, "鑲＄エ")) == 0:
-            missing.append("鑲＄エ")
-        if not p_title(r, "璁板綍"):
-            missing.append("璁板綍")
+        if not fields.get("date") or not p_date(r, fields["date"]):
+            missing.append("日期")
+        if not fields.get("direction") or p_select(r, fields["direction"]) not in {"BUY", "SELL"}:
+            missing.append("方向")
+        if not fields.get("shares") or p_number(r, fields["shares"]) is None:
+            missing.append("股数")
+        if not fields.get("price") or p_number(r, fields["price"]) is None:
+            missing.append("价格")
+        if not fields.get("stock") or len(p_relation_ids(r, fields["stock"])) == 0:
+            missing.append("股票")
+        if not fields.get("title"):
+            missing.append("标题")
+        elif get_prop(r, fields["title"]).get("type") == "title":
+            if not p_title(r, fields["title"]):
+                missing.append("标题")
+        elif not _prop_text_any(r, fields["title"]):
+            missing.append("标题")
         if missing:
             failures.append((r.get("id", ""), missing))
 
-    print(f"妫€鏌ヨ褰曟暟(manual/鏈爣娉?: {checked}")
-    print(f"涓嶅悎瑙勮褰曟暟: {len(failures)}")
+    print(f"检查记录数(manual/未标注): {checked}")
+    print(f"不合规记录数: {len(failures)}")
     for rid, missing in failures[:20]:
-        print(f"- {rid}: 缂哄け {','.join(missing)}")
+        print(f"- {rid}: 缺失 {','.join(missing)}")
     return 0 if not failures else 2
 
 
@@ -763,6 +788,26 @@ def _resolve_trade_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "stock": _find_prop_name(props, ["鑲＄エ"], ["relation"]),
         "realized": _find_prop_name(props, ["单笔已实现收益"], ["formula", "number"]),
     }
+
+
+def _resolve_trade_write_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    props = trade_db.get("properties", {})
+    title_name = find_title_property_name(trade_db)
+    out = {
+        "title": title_name,
+        "date": _find_prop_name(props, ["日期"], ["date"]),
+        "direction": _find_prop_name(props, ["方向"], ["select", "status"]),
+        "shares": _find_prop_name(props, ["股数"], ["number"]),
+        "price": _find_prop_name(props, ["价格"], ["number"]),
+        "fee": _find_prop_name(props, ["手续费", "费用"], ["number"]),
+        "tax": _find_prop_name(props, ["税费", "印花税"], ["number"]),
+        "stock": _find_prop_name(props, ["股票"], ["relation"]),
+        "strategy": _find_prop_name(props, ["策略"], ["select", "status", "rich_text", "title"]),
+        "note": _find_prop_name(props, ["备注"], ["rich_text", "title"]),
+        "source_table": _find_prop_name(props, ["source_table"], ["select", "status"]),
+        "import_status": _find_prop_name(props, ["import_status"], ["select", "status"]),
+    }
+    return out
 
 
 def _find_prop_by_keywords(
@@ -1024,7 +1069,15 @@ def _recommend_from_points(
     points: List[TradePoint],
     allow_small_sample: bool,
     min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    cfg = param_cfg or {}
+    trend_threshold = float(cfg.get("trend_threshold", 0.015))
+    vol_cap = float(cfg.get("vol_cap", 0.10))
+    band_low = float(cfg.get("band_low", 0.01))
+    band_high = float(cfg.get("band_high", 0.12))
+    stop_mult = float(cfg.get("stop_mult", 1.8))
+    rr_min = float(cfg.get("rr_min", 0.8))
     if current_price is None or current_price <= 0:
         return {
             "action": "HOLD",
@@ -1069,7 +1122,7 @@ def _recommend_from_points(
         conf_level = "MEDIUM"
 
     vol = _safe_stdev(returns[-20:]) if returns else 0.02
-    if vol > 0.10:
+    if vol > vol_cap:
         return {
             "action": "HOLD",
             "buy_price": round(current_price * 0.99, 4),
@@ -1085,11 +1138,11 @@ def _recommend_from_points(
     ma_window = min(20, len(prices))
     moving_avg = _safe_mean(prices[-ma_window:]) if ma_window > 0 else current_price
     trend = (current_price / moving_avg - 1.0) if moving_avg > 0 else 0.0
-    band = _clamp(max(vol * 1.2, 0.01), 0.01, 0.12)
+    band = _clamp(max(vol * 1.2, band_low), band_low, band_high)
 
     buy_price = current_price * (1.0 - band)
     sell_price = current_price * (1.0 + band)
-    stop_price = current_price * (1.0 - band * 1.8)
+    stop_price = current_price * (1.0 - band * stop_mult)
 
     if current_cost is not None and current_cost > 0:
         buy_price = min(buy_price, current_cost * 0.995)
@@ -1097,16 +1150,16 @@ def _recommend_from_points(
 
     action = "HOLD"
     reason = "neutral"
-    if trend > 0.015:
+    if trend > trend_threshold:
         action = "BUY"
         reason = "up trend"
-    elif trend < -0.015:
+    elif trend < -trend_threshold:
         action = "SELL"
         reason = "down trend"
 
     expected_up = max(0.0, (sell_price - current_price) / current_price)
     expected_down = max(0.0, (current_price - stop_price) / current_price)
-    if expected_up <= expected_down * 0.8:
+    if expected_up <= expected_down * rr_min:
         action = "HOLD"
         reason = "risk/reward not favorable"
 
@@ -1161,6 +1214,7 @@ def _recommend_chan_from_points(
     points: List[TradePoint],
     allow_small_sample: bool,
     min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     base = _recommend_from_points(
         current_price=current_price,
@@ -1168,6 +1222,7 @@ def _recommend_chan_from_points(
         points=points,
         allow_small_sample=allow_small_sample,
         min_confidence=min_confidence,
+        param_cfg=param_cfg,
     )
     if current_price is None or current_price <= 0:
         return base
@@ -1247,6 +1302,7 @@ def _recommend_atr_wave_from_points(
     points: List[TradePoint],
     allow_small_sample: bool,
     min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     base = _recommend_from_points(
         current_price=current_price,
@@ -1254,6 +1310,7 @@ def _recommend_atr_wave_from_points(
         points=points,
         allow_small_sample=allow_small_sample,
         min_confidence=min_confidence,
+        param_cfg=param_cfg,
     )
     if current_price is None or current_price <= 0:
         return base
@@ -1322,14 +1379,15 @@ def _recommend_by_strategy(
     points: List[TradePoint],
     allow_small_sample: bool,
     min_confidence: str,
+    param_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sid = strategy_id.lower()
     if sid == "baseline":
-        rec = _recommend_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+        rec = _recommend_from_points(current_price, current_cost, points, allow_small_sample, min_confidence, param_cfg=param_cfg)
     elif sid == "chan":
-        rec = _recommend_chan_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+        rec = _recommend_chan_from_points(current_price, current_cost, points, allow_small_sample, min_confidence, param_cfg=param_cfg)
     elif sid == "atr_wave":
-        rec = _recommend_atr_wave_from_points(current_price, current_cost, points, allow_small_sample, min_confidence)
+        rec = _recommend_atr_wave_from_points(current_price, current_cost, points, allow_small_sample, min_confidence, param_cfg=param_cfg)
     else:
         raise ValueError(f"unsupported strategy: {strategy_id}")
     rec["strategy_id"] = sid.upper()
@@ -1371,25 +1429,43 @@ def _collect_recommendations(
 ) -> List[Dict[str, Any]]:
     selected_strategies = _parse_strategy_set(getattr(args, "strategy_set", "baseline,chan,atr_wave"))
     recs: List[Dict[str, Any]] = []
-    for row in stock_rows:
-        stock_id = row.get("id", "")
-        title = p_title(row, stock_fields["title"]) if stock_fields["title"] else stock_id
-        code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
-        current_price = p_number(row, stock_fields["current_price"]) if stock_fields["current_price"] else None
-        current_cost = p_number(row, stock_fields["current_cost"]) if stock_fields["current_cost"] else None
-        for sid in selected_strategies:
-            rec = _recommend_by_strategy(
-                strategy_id=sid,
-                current_price=current_price,
-                current_cost=current_cost,
-                points=stock_points.get(stock_id, []),
-                allow_small_sample=args.allow_small_sample,
-                min_confidence=args.min_confidence,
-            )
-            rec["stock_id"] = stock_id
-            rec["stock_name"] = title
-            rec["stock_code"] = code_raw
-            recs.append(rec)
+    market_rule = os.getenv("SNAPSHOT_MARKET_RULE", "")
+    override_market = (getattr(args, "param_market", "") or "").strip().upper()
+    scope = (getattr(args, "param_scope", "") or "*").strip() or "*"
+    store = ParamStore(_sqlite_path())
+    param_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    try:
+        for row in stock_rows:
+            stock_id = row.get("id", "")
+            title = p_title(row, stock_fields["title"]) if stock_fields["title"] else stock_id
+            code_raw = _prop_text_any(row, stock_fields["stock_code"]) if stock_fields.get("stock_code") else ""
+            current_price = p_number(row, stock_fields["current_price"]) if stock_fields["current_price"] else None
+            current_cost = p_number(row, stock_fields["current_cost"]) if stock_fields["current_cost"] else None
+            market = override_market or _market_from_rule(code_raw, market_rule)
+            for sid in selected_strategies:
+                key = (sid.upper(), market.upper(), scope)
+                if key not in param_cache:
+                    param_cache[key] = store.get_active_param_set(strategy_id=sid, market=market, symbol_scope=scope)
+                active = param_cache[key]
+                param_cfg = active.get("params", {})
+                rec = _recommend_by_strategy(
+                    strategy_id=sid,
+                    current_price=current_price,
+                    current_cost=current_cost,
+                    points=stock_points.get(stock_id, []),
+                    allow_small_sample=bool(param_cfg.get("allow_small_sample", args.allow_small_sample)),
+                    min_confidence=str(param_cfg.get("min_confidence", args.min_confidence)),
+                    param_cfg=param_cfg,
+                )
+                rec["stock_id"] = stock_id
+                rec["stock_name"] = title
+                rec["stock_code"] = code_raw
+                rec["market"] = market
+                rec["param_version"] = active.get("version", 0)
+                rec["param_snapshot"] = param_cfg
+                recs.append(rec)
+    finally:
+        store.close()
     return recs
 
 
@@ -1597,8 +1673,13 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
     strategy_total_counts: Dict[str, int] = defaultdict(int)
     baseline_returns: List[float] = []
     all_strategy_returns: List[float] = []
+    market = (getattr(args, "param_market", "") or "SH").upper()
+    scope = (getattr(args, "param_scope", "") or "*").strip() or "*"
+    store = ParamStore(_sqlite_path())
+    param_cache: Dict[str, Dict[str, Any]] = {}
 
-    for points in stock_points.values():
+    try:
+        for points in stock_points.values():
         valid = [p for p in points if p.price is not None and p.price > 0]
         if len(valid) < 8:
             continue
@@ -1620,13 +1701,19 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
 
             baseline_returns.append(baseline_ret)
             for sid in selected_strategies:
+                sid_upper = sid.upper()
+                if sid_upper not in param_cache:
+                    param_cache[sid_upper] = store.get_active_param_set(strategy_id=sid_upper, market=market, symbol_scope=scope)
+                active = param_cache[sid_upper]
+                p_cfg = active.get("params", {})
                 rec = _recommend_by_strategy(
                     strategy_id=sid,
                     current_price=curr.price,
                     current_cost=None,
                     points=hist,
-                    allow_small_sample=args.allow_small_sample,
-                    min_confidence=args.min_confidence,
+                    allow_small_sample=bool(p_cfg.get("allow_small_sample", args.allow_small_sample)),
+                    min_confidence=str(p_cfg.get("min_confidence", args.min_confidence)),
+                    param_cfg=p_cfg,
                 )
 
                 if rec["action"] == "BUY":
@@ -1653,12 +1740,17 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
         m["hold_ratio"] = hold_ratio
         strategy_metrics[sid] = m
 
+    finally:
+        store.close()
+
     out = {
         "baseline": _returns_metrics(baseline_returns),
         "strategy_all": _returns_metrics(all_strategy_returns),
         "strategy_by_mode": {k: _returns_metrics(v) for k, v in mode_returns.items()},
         "strategy_metrics": strategy_metrics,
         "strategy_mode_metrics": {k: _returns_metrics(v) for k, v in strategy_mode_returns.items()},
+        "param_versions": {k: int(v.get("version", 0)) for k, v in param_cache.items()},
+        "param_market": market,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -1692,6 +1784,30 @@ def _load_json_arg(raw: str) -> Dict[str, Any]:
         with open(text, "r", encoding="utf-8") as f:
             return json.load(f)
     return json.loads(text)
+
+
+def _now_ms() -> float:
+    return time.time() * 1000.0
+
+
+def _log_param_event(action: str, status: str, started_ms: float, meta: Dict[str, Any], run_id: str = "", proposal_id: str = "", apply_log_id: str = "", error_code: str = "", error_msg: str = "") -> None:
+    store = ParamStore(_sqlite_path())
+    try:
+        duration = int(max(0.0, _now_ms() - started_ms))
+        store.log_event(
+            module="param",
+            action=action,
+            status=status,
+            duration_ms=duration,
+            meta=meta,
+            run_id=run_id,
+            proposal_id=proposal_id,
+            apply_log_id=apply_log_id,
+            error_code=error_code,
+            error_msg=error_msg,
+        )
+    finally:
+        store.close()
 
 
 def _history_payload(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1759,29 +1875,34 @@ def history_query(args: argparse.Namespace) -> int:
 
 
 def param_recommend(args: argparse.Namespace) -> int:
+    started = _now_ms()
     start_date = _today_or(getattr(args, "start_date", ""))
     end_date = _today_or(getattr(args, "end_date", "")) if getattr(args, "end_date", "") else start_date
     strategies = [x.upper() for x in _split_csv(getattr(args, "strategies", ""))]
     markets = [x.upper() for x in _split_csv(getattr(args, "markets", ""))]
 
-    snap = SnapshotStore(_sqlite_path())
     try:
-        rows = snap.query_range(start_date, end_date, strategies=strategies or None, markets=markets or None)
-    finally:
-        snap.close()
+        snap = SnapshotStore(_sqlite_path())
+        try:
+            rows = snap.query_range(start_date, end_date, strategies=strategies or None, markets=markets or None)
+        finally:
+            snap.close()
 
-    run_id = uuid4().hex[:12]
-    store = ParamStore(_sqlite_path())
-    try:
-        out_rows = store.create_proposals_from_history(
-            snapshot_rows=rows,
-            source_start_date=start_date,
-            source_end_date=end_date,
-            run_id=run_id,
-            dry_run=bool(getattr(args, "dry_run", False)),
-        )
-    finally:
-        store.close()
+        run_id = uuid4().hex[:12]
+        store = ParamStore(_sqlite_path())
+        try:
+            out_rows = store.create_proposals_from_history(
+                snapshot_rows=rows,
+                source_start_date=start_date,
+                source_end_date=end_date,
+                run_id=run_id,
+                dry_run=bool(getattr(args, "dry_run", False)),
+                walk_forward_splits=int(getattr(args, "walk_forward_splits", 3)),
+                cost_bps=float(getattr(args, "cost_bps", 3.0)),
+                slippage_bps=float(getattr(args, "slippage_bps", 2.0)),
+            )
+        finally:
+            store.close()
 
     print(
         json.dumps(
@@ -1797,24 +1918,62 @@ def param_recommend(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
-    return 0
+        _log_param_event(
+            action="param_recommend",
+            status="SUCCESS",
+            started_ms=started,
+            meta={"proposal_count": len(out_rows), "dry_run": bool(getattr(args, "dry_run", False))},
+            run_id=run_id,
+        )
+        return 0
+    except Exception as e:
+        _log_param_event(
+            action="param_recommend",
+            status="FAILED",
+            started_ms=started,
+            meta={"dry_run": bool(getattr(args, "dry_run", False))},
+            error_code="PARAM_RECOMMEND_FAILED",
+            error_msg=str(e),
+        )
+        raise
 
 
 def param_diff(args: argparse.Namespace) -> int:
+    started = _now_ms()
     proposal_id = (getattr(args, "proposal_id", "") or "").strip()
     if not proposal_id:
         raise RuntimeError("proposal-id is required")
     editor_values = _load_json_arg(getattr(args, "editor_json", ""))
-    store = ParamStore(_sqlite_path())
     try:
-        out = store.diff(proposal_id, editor_values=editor_values or None)
-    finally:
-        store.close()
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+        store = ParamStore(_sqlite_path())
+        try:
+            out = store.diff(proposal_id, editor_values=editor_values or None)
+        finally:
+            store.close()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        _log_param_event(
+            action="param_diff",
+            status="SUCCESS",
+            started_ms=started,
+            meta={"changed_count": int(out.get("changed_count", 0))},
+            proposal_id=proposal_id,
+        )
+        return 0
+    except Exception as e:
+        _log_param_event(
+            action="param_diff",
+            status="FAILED",
+            started_ms=started,
+            meta={},
+            proposal_id=proposal_id,
+            error_code="PARAM_DIFF_FAILED",
+            error_msg=str(e),
+        )
+        raise
 
 
 def param_apply(args: argparse.Namespace) -> int:
+    started = _now_ms()
     proposal_id = (getattr(args, "proposal_id", "") or "").strip()
     if not proposal_id:
         raise RuntimeError("proposal-id is required")
@@ -1822,38 +1981,82 @@ def param_apply(args: argparse.Namespace) -> int:
     operator = (getattr(args, "operator", "") or os.getenv("OPERATOR", "local_user")).strip() or "local_user"
     comment = getattr(args, "comment", "") or ""
     expected_version = int(getattr(args, "expected_version", -1))
+    batch_id = (getattr(args, "batch_id", "") or "").strip()
+    rollout_scope = (getattr(args, "rollout_scope", "") or "full").strip() or "full"
 
-    store = ParamStore(_sqlite_path())
     try:
-        out = store.apply(
+        store = ParamStore(_sqlite_path())
+        try:
+            out = store.apply(
+                proposal_id=proposal_id,
+                editor_values=editor_values or None,
+                operator=operator,
+                comment=comment,
+                expected_version=expected_version if expected_version >= 0 else None,
+                batch_id=batch_id,
+                rollout_scope=rollout_scope,
+            )
+        finally:
+            store.close()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        _log_param_event(
+            action="param_apply",
+            status="SUCCESS",
+            started_ms=started,
+            meta={"changed_count": int(out.get("changed_count", 0)), "batch_id": batch_id, "rollout_scope": rollout_scope},
             proposal_id=proposal_id,
-            editor_values=editor_values or None,
-            operator=operator,
-            comment=comment,
-            expected_version=expected_version if expected_version >= 0 else None,
+            apply_log_id=str(out.get("apply_log_id", "")),
         )
-    finally:
-        store.close()
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+        return 0
+    except Exception as e:
+        _log_param_event(
+            action="param_apply",
+            status="FAILED",
+            started_ms=started,
+            meta={"batch_id": batch_id, "rollout_scope": rollout_scope},
+            proposal_id=proposal_id,
+            error_code="PARAM_APPLY_FAILED",
+            error_msg=str(e),
+        )
+        raise
 
 
 def param_rollback(args: argparse.Namespace) -> int:
+    started = _now_ms()
     apply_log_id = (getattr(args, "apply_log_id", "") or "").strip()
     if not apply_log_id:
         raise RuntimeError("apply-log-id is required")
     operator = (getattr(args, "operator", "") or os.getenv("OPERATOR", "local_user")).strip() or "local_user"
     comment = getattr(args, "comment", "") or ""
-    store = ParamStore(_sqlite_path())
     try:
-        out = store.rollback(apply_log_id=apply_log_id, operator=operator, comment=comment)
-    finally:
-        store.close()
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+        store = ParamStore(_sqlite_path())
+        try:
+            out = store.rollback(apply_log_id=apply_log_id, operator=operator, comment=comment)
+        finally:
+            store.close()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        _log_param_event(
+            action="param_rollback",
+            status="SUCCESS",
+            started_ms=started,
+            meta={"rollback_ref": apply_log_id},
+            apply_log_id=str(out.get("apply_log_id", "")),
+        )
+        return 0
+    except Exception as e:
+        _log_param_event(
+            action="param_rollback",
+            status="FAILED",
+            started_ms=started,
+            meta={"rollback_ref": apply_log_id},
+            error_code="PARAM_ROLLBACK_FAILED",
+            error_msg=str(e),
+        )
+        raise
 
 
 def param_draft_save(args: argparse.Namespace) -> int:
+    started = _now_ms()
     proposal_id = (getattr(args, "proposal_id", "") or "").strip()
     if not proposal_id:
         raise RuntimeError("proposal-id is required")
@@ -1861,6 +2064,24 @@ def param_draft_save(args: argparse.Namespace) -> int:
     store = ParamStore(_sqlite_path())
     try:
         out = store.save_draft(proposal_id=proposal_id, editor_values=editor_values)
+    finally:
+        store.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    _log_param_event(
+        action="param_draft_save",
+        status="SUCCESS",
+        started_ms=started,
+        meta={},
+        proposal_id=proposal_id,
+    )
+    return 0
+
+
+def param_monitor(args: argparse.Namespace) -> int:
+    days = int(getattr(args, "days", 7) or 7)
+    store = ParamStore(_sqlite_path())
+    try:
+        out = store.get_monitor(days=days)
     finally:
         store.close()
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1906,9 +2127,18 @@ def sync_snapshot_notion(client: NotionClient, cfg: Cfg, args: argparse.Namespac
     db_props = snapshot_db.get("properties", {})
     fields = _resolve_snapshot_notion_fields(snapshot_db)
     if not fields.get("date") or not fields.get("strategy") or not fields.get("stock_code"):
-        raise RuntimeError("Notion snapshot DB must contain 鏃ユ湡/绛栫暐/鑲＄エ浠ｇ爜 fields.")
+        raise RuntimeError("Notion snapshot DB must contain 日期/策略/股票代码 fields.")
 
-    existing_rows = client.query_database_all(cfg.strategy_snapshot_id)
+    existing_rows: List[Dict[str, Any]]
+    date_field = fields["date"]
+    date_field_type = db_props.get(date_field, {}).get("type") if date_field else ""
+    if date_field and date_field_type == "date":
+        existing_rows = client.query_database_all(
+            cfg.strategy_snapshot_id,
+            filter_obj={"property": date_field, "date": {"equals": snapshot_date}},
+        )
+    else:
+        existing_rows = client.query_database_all(cfg.strategy_snapshot_id)
     existing_index: Dict[str, str] = {}
     for row in existing_rows:
         key = _snapshot_notion_key_from_page(row, fields)
@@ -2013,6 +2243,8 @@ def build_parser() -> argparse.ArgumentParser:
     s_rec.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
     s_rec.add_argument("--emit-snapshot", action="store_true", help="recommend后写入每日快照")
     s_rec.add_argument("--snapshot-date", default="", help="快照日期，默认今天 YYYY-MM-DD")
+    s_rec.add_argument("--param-market", default="", help="参数市场，默认按股票代码推断")
+    s_rec.add_argument("--param-scope", default="*", help="参数作用域，默认 *")
 
     s_bt = sub.add_parser("backtest-recommendation", help="回测建议模型")
     s_bt.add_argument("--window", type=int, default=60, help="历史窗口长度（按交易事件）")
@@ -2020,6 +2252,8 @@ def build_parser() -> argparse.ArgumentParser:
     s_bt.add_argument("--disallow-small-sample", action="store_false", dest="allow_small_sample")
     s_bt.add_argument("--min-confidence", choices=["LOW", "MEDIUM", "HIGH"], default="MEDIUM")
     s_bt.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
+    s_bt.add_argument("--param-market", default="SH", help="参数市场，回测默认 SH")
+    s_bt.add_argument("--param-scope", default="*", help="参数作用域，默认 *")
 
     s_sp = sub.add_parser("sync-prices", help="自动拉取实时行情并回写当前市价")
     s_sp.add_argument("--dry-run", action="store_true", help="仅拉取并输出统计，不写入Notion")
@@ -2034,6 +2268,8 @@ def build_parser() -> argparse.ArgumentParser:
     s_sd.add_argument("--strategy-set", default="baseline,chan,atr_wave", help="comma list: baseline,chan,atr_wave")
     s_sd.add_argument("--refresh-prices", action="store_true", help="先同步实时价格再快照")
     s_sd.add_argument("--timeout", type=int, default=8, help="实时行情请求超时秒数")
+    s_sd.add_argument("--param-market", default="", help="参数市场，默认按股票代码推断")
+    s_sd.add_argument("--param-scope", default="*", help="参数作用域，默认 *")
 
     s_sn = sub.add_parser("sync-snapshot-notion", help="同步指定日期快照到Notion策略快照库")
     s_sn.add_argument("--snapshot-date", default="", help="同步日期，默认今天 YYYY-MM-DD")
@@ -2051,6 +2287,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_pr.add_argument("--strategies", default="", help="策略过滤，如 BASELINE,CHAN")
     s_pr.add_argument("--markets", default="", help="市场过滤，如 SH,SZ,HK")
     s_pr.add_argument("--dry-run", action="store_true", help="仅计算推荐，不写入proposal表")
+    s_pr.add_argument("--walk-forward-splits", type=int, default=3, help="walk-forward 分窗数量")
+    s_pr.add_argument("--cost-bps", type=float, default=3.0, help="交易成本bps")
+    s_pr.add_argument("--slippage-bps", type=float, default=2.0, help="滑点bps")
 
     s_pd = sub.add_parser("param-diff", help="比较当前值、推荐值、人工编辑值")
     s_pd.add_argument("--proposal-id", required=True, help="参数推荐ID")
@@ -2062,6 +2301,8 @@ def build_parser() -> argparse.ArgumentParser:
     s_pa.add_argument("--expected-version", type=int, default=-1, help="并发保护版本号，-1表示不校验")
     s_pa.add_argument("--operator", default="", help="操作者，默认取 OPERATOR 或 local_user")
     s_pa.add_argument("--comment", default="", help="应用备注")
+    s_pa.add_argument("--batch-id", default="", help="发布批次ID")
+    s_pa.add_argument("--rollout-scope", default="full", help="灰度范围，如 full/market:SH/strategy:BASELINE")
 
     s_proll = sub.add_parser("param-rollback", help="按 apply_log_id 回滚参数")
     s_proll.add_argument("--apply-log-id", required=True, help="apply_log_id")
@@ -2071,6 +2312,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_pdraft = sub.add_parser("param-draft-save", help="保存参数编辑草稿")
     s_pdraft.add_argument("--proposal-id", required=True, help="参数推荐ID")
     s_pdraft.add_argument("--editor-json", default="", help="人工编辑JSON文本或json文件路径")
+
+    s_pmon = sub.add_parser("param-monitor", help="输出参数系统健康与最近异常")
+    s_pmon.add_argument("--days", type=int, default=7, help="统计窗口天数")
 
     return p
 def main() -> int:
@@ -2093,6 +2337,8 @@ def main() -> int:
         return param_rollback(args)
     if args.cmd == "param-draft-save":
         return param_draft_save(args)
+    if args.cmd == "param-monitor":
+        return param_monitor(args)
 
     if not args.token:
         print("Missing NOTION_TOKEN.", file=sys.stderr)
