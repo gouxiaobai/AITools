@@ -269,6 +269,13 @@ class ParamStore:
         params, version = self._load_param_set(strategy_id, market, symbol_scope)
         return {"strategy_id": _norm_strategy(strategy_id), "market": market.upper(), "symbol_scope": symbol_scope, "params": params, "version": version}
 
+    # Backward-compatible aliases for legacy call sites.
+    def get_param_set(self, strategy_id: str, market: str, symbol_scope: str = "*") -> Dict[str, Any]:
+        return self.get_active_param_set(strategy_id=strategy_id, market=market, symbol_scope=symbol_scope)
+
+    def get_params(self, strategy_id: str, market: str, symbol_scope: str = "*") -> Dict[str, Any]:
+        return self.get_active_param_set(strategy_id=strategy_id, market=market, symbol_scope=symbol_scope).get("params", {})
+
     def create_proposals_from_history(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0) -> List[Dict[str, Any]]:
         buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for row in snapshot_rows:
@@ -356,6 +363,19 @@ class ParamStore:
                         ),
                     )
         return out
+
+    def create_proposals(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0) -> List[Dict[str, Any]]:
+        return self.create_proposals_from_history(
+            snapshot_rows=snapshot_rows,
+            source_start_date=source_start_date,
+            source_end_date=source_end_date,
+            run_id=run_id,
+            symbol_scope=symbol_scope,
+            dry_run=dry_run,
+            walk_forward_splits=walk_forward_splits,
+            cost_bps=cost_bps,
+            slippage_bps=slippage_bps,
+        )
 
     def get_proposal(self, proposal_id: str) -> Dict[str, Any]:
         row = self.conn.execute("SELECT * FROM strategy_param_proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
@@ -513,6 +533,18 @@ class ParamStore:
             )
         return {"apply_log_id": apply_log_id, "changed_count": changed_count, "skipped_count": skipped_count, "warnings": [], "idempotent": False, "version": new_version, "batch_id": batch_id, "rollout_scope": rollout_scope}
 
+    def apply_proposal(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "", gray_scope: str = "") -> Dict[str, Any]:
+        effective_rollout_scope = (rollout_scope or gray_scope or "full").strip() or "full"
+        return self.apply(
+            proposal_id=proposal_id,
+            editor_values=editor_values,
+            operator=operator,
+            comment=comment,
+            expected_version=expected_version,
+            batch_id=batch_id,
+            rollout_scope=effective_rollout_scope,
+        )
+
     def rollback(self, apply_log_id: str, operator: str = "local_user", comment: str = "") -> Dict[str, Any]:
         row = self.conn.execute("SELECT * FROM strategy_param_apply_log WHERE apply_log_id=?", (apply_log_id,)).fetchone()
         if not row:
@@ -560,6 +592,9 @@ class ParamStore:
             )
         return {"apply_log_id": rollback_apply_id, "rollback_ref": apply_log_id, "changed_count": changed_count, "skipped_count": len(PARAM_SCHEMA) - changed_count, "warnings": [], "version": new_version}
 
+    def rollback_apply(self, apply_log_id: str, operator: str = "local_user", comment: str = "") -> Dict[str, Any]:
+        return self.rollback(apply_log_id=apply_log_id, operator=operator, comment=comment)
+
     def get_monitor(self, days: int = 7) -> Dict[str, Any]:
         days = max(1, int(days))
         cutoff = (dt.datetime.now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
@@ -594,3 +629,20 @@ class ParamStore:
             "apply_stat": apply_stat,
             "recent_failures": [dict(x) for x in recent_failures],
         }
+
+    def monitor(self, days: int = 7) -> Dict[str, Any]:
+        return self.get_monitor(days=days)
+
+    def log_run_event(self, module: str, action: str, status: str, duration_ms: int, meta: Optional[Dict[str, Any]] = None, run_id: str = "", proposal_id: str = "", apply_log_id: str = "", error_code: str = "", error_msg: str = "") -> str:
+        return self.log_event(
+            module=module,
+            action=action,
+            status=status,
+            duration_ms=duration_ms,
+            meta=meta,
+            run_id=run_id,
+            proposal_id=proposal_id,
+            apply_log_id=apply_log_id,
+            error_code=error_code,
+            error_msg=error_msg,
+        )

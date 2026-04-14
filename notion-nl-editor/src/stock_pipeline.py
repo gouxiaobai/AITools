@@ -1680,65 +1680,65 @@ def backtest_recommendation(client: NotionClient, cfg: Cfg, args: argparse.Names
 
     try:
         for points in stock_points.values():
-        valid = [p for p in points if p.price is not None and p.price > 0]
-        if len(valid) < 8:
-            continue
-        for idx in range(5, len(valid) - 1):
-            hist = valid[max(0, idx - args.window) : idx]
-            curr = valid[idx]
-            nxt = valid[idx + 1]
-            if not curr.price or not nxt.price:
+            valid = [p for p in points if p.price is not None and p.price > 0]
+            if len(valid) < 8:
                 continue
-            move = (nxt.price - curr.price) / curr.price
+            for idx in range(5, len(valid) - 1):
+                hist = valid[max(0, idx - args.window) : idx]
+                curr = valid[idx]
+                nxt = valid[idx + 1]
+                if not curr.price or not nxt.price:
+                    continue
+                move = (nxt.price - curr.price) / curr.price
 
-            actual_dir = curr.direction
-            if actual_dir == "BUY":
-                baseline_ret = move
-            elif actual_dir == "SELL":
-                baseline_ret = -move
-            else:
-                baseline_ret = 0.0
-
-            baseline_returns.append(baseline_ret)
-            for sid in selected_strategies:
-                sid_upper = sid.upper()
-                if sid_upper not in param_cache:
-                    param_cache[sid_upper] = store.get_active_param_set(strategy_id=sid_upper, market=market, symbol_scope=scope)
-                active = param_cache[sid_upper]
-                p_cfg = active.get("params", {})
-                rec = _recommend_by_strategy(
-                    strategy_id=sid,
-                    current_price=curr.price,
-                    current_cost=None,
-                    points=hist,
-                    allow_small_sample=bool(p_cfg.get("allow_small_sample", args.allow_small_sample)),
-                    min_confidence=str(p_cfg.get("min_confidence", args.min_confidence)),
-                    param_cfg=p_cfg,
-                )
-
-                if rec["action"] == "BUY":
-                    strategy_ret = move
-                elif rec["action"] == "SELL":
-                    strategy_ret = -move
+                actual_dir = curr.direction
+                if actual_dir == "BUY":
+                    baseline_ret = move
+                elif actual_dir == "SELL":
+                    baseline_ret = -move
                 else:
-                    strategy_ret = 0.0
+                    baseline_ret = 0.0
 
-                sid_upper = rec["strategy_id"]
-                strategy_total_counts[sid_upper] += 1
-                if rec["action"] == "HOLD":
-                    strategy_hold_counts[sid_upper] += 1
-                strategy_returns[sid_upper].append(strategy_ret)
-                strategy_mode_returns[f"{sid_upper}:{rec['mode']}"].append(strategy_ret)
-                mode_returns[rec["mode"]].append(strategy_ret)
-                all_strategy_returns.append(strategy_ret)
+                baseline_returns.append(baseline_ret)
+                for sid in selected_strategies:
+                    sid_upper = sid.upper()
+                    if sid_upper not in param_cache:
+                        param_cache[sid_upper] = store.get_active_param_set(strategy_id=sid_upper, market=market, symbol_scope=scope)
+                    active = param_cache[sid_upper]
+                    p_cfg = active.get("params", {})
+                    rec = _recommend_by_strategy(
+                        strategy_id=sid,
+                        current_price=curr.price,
+                        current_cost=None,
+                        points=hist,
+                        allow_small_sample=bool(p_cfg.get("allow_small_sample", args.allow_small_sample)),
+                        min_confidence=str(p_cfg.get("min_confidence", args.min_confidence)),
+                        param_cfg=p_cfg,
+                    )
 
-    strategy_metrics: Dict[str, Dict[str, float]] = {}
-    for sid, arr in strategy_returns.items():
-        m = _returns_metrics(arr)
-        total = max(strategy_total_counts.get(sid, 0), 1)
-        hold_ratio = strategy_hold_counts.get(sid, 0) / total
-        m["hold_ratio"] = hold_ratio
-        strategy_metrics[sid] = m
+                    if rec["action"] == "BUY":
+                        strategy_ret = move
+                    elif rec["action"] == "SELL":
+                        strategy_ret = -move
+                    else:
+                        strategy_ret = 0.0
+
+                    sid_upper = rec["strategy_id"]
+                    strategy_total_counts[sid_upper] += 1
+                    if rec["action"] == "HOLD":
+                        strategy_hold_counts[sid_upper] += 1
+                    strategy_returns[sid_upper].append(strategy_ret)
+                    strategy_mode_returns[f"{sid_upper}:{rec['mode']}"].append(strategy_ret)
+                    mode_returns[rec["mode"]].append(strategy_ret)
+                    all_strategy_returns.append(strategy_ret)
+
+        strategy_metrics: Dict[str, Dict[str, float]] = {}
+        for sid, arr in strategy_returns.items():
+            m = _returns_metrics(arr)
+            total = max(strategy_total_counts.get(sid, 0), 1)
+            hold_ratio = strategy_hold_counts.get(sid, 0) / total
+            m["hold_ratio"] = hold_ratio
+            strategy_metrics[sid] = m
 
     finally:
         store.close()
@@ -1904,20 +1904,20 @@ def param_recommend(args: argparse.Namespace) -> int:
         finally:
             store.close()
 
-    print(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "source_start_date": start_date,
-                "source_end_date": end_date,
-                "proposal_count": len(out_rows),
-                "dry_run": bool(getattr(args, "dry_run", False)),
-                "proposals": out_rows,
-            },
-            ensure_ascii=False,
-            indent=2,
+        print(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "source_start_date": start_date,
+                    "source_end_date": end_date,
+                    "proposal_count": len(out_rows),
+                    "dry_run": bool(getattr(args, "dry_run", False)),
+                    "proposals": out_rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         )
-    )
         _log_param_event(
             action="param_recommend",
             status="SUCCESS",
@@ -1982,7 +1982,7 @@ def param_apply(args: argparse.Namespace) -> int:
     comment = getattr(args, "comment", "") or ""
     expected_version = int(getattr(args, "expected_version", -1))
     batch_id = (getattr(args, "batch_id", "") or "").strip()
-    rollout_scope = (getattr(args, "rollout_scope", "") or "full").strip() or "full"
+    rollout_scope = (getattr(args, "rollout_scope", "") or getattr(args, "gray_scope", "") or "full").strip() or "full"
 
     try:
         store = ParamStore(_sqlite_path())
@@ -2303,6 +2303,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_pa.add_argument("--comment", default="", help="应用备注")
     s_pa.add_argument("--batch-id", default="", help="发布批次ID")
     s_pa.add_argument("--rollout-scope", default="full", help="灰度范围，如 full/market:SH/strategy:BASELINE")
+    s_pa.add_argument("--gray-scope", default="", help="兼容旧参数名，等价于 --rollout-scope")
 
     s_proll = sub.add_parser("param-rollback", help="按 apply_log_id 回滚参数")
     s_proll.add_argument("--apply-log-id", required=True, help="apply_log_id")
