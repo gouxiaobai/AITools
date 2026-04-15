@@ -497,7 +497,7 @@ def _render_history_result(parsed: Optional[Any], raw: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="股票策略控制台", layout="wide")
     st.title("股票策略控制台")
-    st.caption("实时行情 -> 建议生成 -> 回测分析 -> 历史追踪")
+    st.caption("一键执行（同步+建议） -> 回测分析 -> 历史追踪")
 
     with st.sidebar:
         st.header("全局配置")
@@ -517,50 +517,47 @@ def main() -> None:
         st.stop()
 
     _show_run_status()
-    tab_price, tab_signal, tab_backtest, tab_history, tab_param, tab_health = st.tabs(
-        ["实时行情", "交易建议", "回测分析", "历史追踪", "参数调优", "系统健康"]
+    tab_signal, tab_backtest, tab_history, tab_param, tab_health = st.tabs(
+        ["交易建议", "回测分析", "历史追踪", "参数调优", "系统健康"]
     )
-
-    with tab_price:
-        st.subheader("实时行情同步")
-        dry_sync = st.checkbox("仅预览，不写入 Notion（dry-run）", value=False, key="tab_sync_dry")
-        if st.button("执行价格同步", type="primary", use_container_width=True):
-            args = argparse.Namespace(dry_run=dry_sync, timeout=int(timeout))
-            code, raw, parsed, run_err = _run_and_capture(sync_prices, client, cfg, args)
-            if run_err or code != 0:
-                msg = run_err or raw or "价格同步失败"
-                st.error(msg)
-                _mark_run("价格同步", False, msg)
-            else:
-                st.success("价格同步完成")
-                _mark_run("价格同步", True, "实时行情已同步")
-                _render_sync_result(parsed, raw)
 
     with tab_signal:
         st.subheader("交易建议")
         allow_small_sample = st.toggle("允许小样本建议（<20）", value=True, key="tab_allow_small")
+        dry_sync_then_rec = st.checkbox("一键流程中价格同步 dry-run", value=False, key="tab_sync_then_rec_dry")
         dry_rec = st.checkbox("仅预览，不写入 Notion（dry-run）", value=True, key="tab_rec_dry")
-        if st.button("执行建议生成", type="primary", use_container_width=True):
-            rec_args = argparse.Namespace(
-                dry_run=dry_rec,
-                asof_date="",
-                allow_small_sample=allow_small_sample,
-                min_confidence=min_conf,
-                strategy_set=",".join(strategy_set),
-                refresh_prices=False,
-                timeout=int(timeout),
-                emit_snapshot=False,
-                snapshot_date="",
-            )
-            code, raw, parsed, run_err = _run_and_capture(recommend_prices, client, cfg, rec_args)
-            if run_err or code != 0:
-                msg = run_err or raw or "建议生成失败"
-                st.error(msg)
-                _mark_run("建议生成", False, msg)
+        if st.button("一键执行：先同步价格，再生成建议", type="primary", use_container_width=True):
+            sync_args = argparse.Namespace(dry_run=dry_sync_then_rec, timeout=int(timeout))
+            sync_code, sync_raw, sync_parsed, sync_err = _run_and_capture(sync_prices, client, cfg, sync_args)
+            if sync_err or sync_code != 0:
+                msg = sync_err or sync_raw or "价格同步失败"
+                st.error(f"步骤1失败（价格同步）：{msg}")
+                _mark_run("价格同步", False, msg)
             else:
-                st.success("建议生成完成")
-                _mark_run("建议生成", True, "建议结果已更新")
-                _render_recommend_result(parsed, raw)
+                st.success("步骤1完成：价格同步成功")
+                _mark_run("价格同步", True, "实时行情已同步")
+                _render_sync_result(sync_parsed, sync_raw)
+
+                rec_args = argparse.Namespace(
+                    dry_run=dry_rec,
+                    asof_date="",
+                    allow_small_sample=allow_small_sample,
+                    min_confidence=min_conf,
+                    strategy_set=",".join(strategy_set),
+                    refresh_prices=False,
+                    timeout=int(timeout),
+                    emit_snapshot=False,
+                    snapshot_date="",
+                )
+                code, raw, parsed, run_err = _run_and_capture(recommend_prices, client, cfg, rec_args)
+                if run_err or code != 0:
+                    msg = run_err or raw or "建议生成失败"
+                    st.error(f"步骤2失败（建议生成）：{msg}")
+                    _mark_run("建议生成", False, msg)
+                else:
+                    st.success("步骤2完成：建议生成成功")
+                    _mark_run("建议生成", True, "建议结果已更新")
+                    _render_recommend_result(parsed, raw)
 
     with tab_backtest:
         st.subheader("回测分析")
@@ -837,7 +834,7 @@ def main() -> None:
                 _show_json_debug("系统健康结果", raw)
 
     st.markdown("---")
-    st.caption("建议：先同步实时行情，再生成建议，最后做快照与历史查询。")
+    st.caption("建议：使用一键执行（先同步再生成建议），最后做快照与历史查询。")
 
 
 if __name__ == "__main__":
