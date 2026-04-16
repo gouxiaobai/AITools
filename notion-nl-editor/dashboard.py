@@ -502,11 +502,20 @@ def main() -> None:
 
     with st.sidebar:
         st.header("全局配置")
-        token_input = st.text_input("NOTION_TOKEN（可留空走 .env）", type="password")
-        notion_version = st.text_input("Notion-Version", value=os.getenv("NOTION_VERSION", "2022-06-28"))
-        min_conf = st.selectbox("最小置信度", options=["LOW", "MEDIUM", "HIGH"], index=1)
-        strategy_set = st.multiselect("并行策略", options=["baseline", "chan", "atr_wave"], default=["baseline", "chan", "atr_wave"])
-        timeout = st.number_input("行情请求超时（秒）", min_value=3, max_value=30, value=8, step=1)
+        token_input = st.text_input("NOTION_TOKEN（可留空走 .env）", type="password", key="sidebar_notion_token")
+        notion_version = st.text_input(
+            "Notion-Version",
+            value=os.getenv("NOTION_VERSION", "2022-06-28"),
+            key="sidebar_notion_version",
+        )
+        min_conf = st.selectbox("最小置信度", options=["LOW", "MEDIUM", "HIGH"], index=1, key="sidebar_min_confidence")
+        strategy_set = st.multiselect(
+            "并行策略",
+            options=["baseline", "chan", "atr_wave"],
+            default=["baseline", "chan", "atr_wave"],
+            key="sidebar_strategy_set",
+        )
+        timeout = st.number_input("行情请求超时（秒）", min_value=3, max_value=30, value=8, step=1, key="sidebar_timeout_sec")
 
     client, err = _init_client(token_input, notion_version)
     cfg = load_cfg()
@@ -524,10 +533,10 @@ def main() -> None:
 
     with tab_signal:
         st.subheader("交易建议")
-        allow_small_sample = st.toggle("允许小样本建议（<20）", value=True, key="tab_allow_small")
-        dry_sync_then_rec = st.checkbox("一键流程中价格同步 dry-run", value=False, key="tab_sync_then_rec_dry")
-        dry_rec = st.checkbox("仅预览，不写入 Notion（dry-run）", value=True, key="tab_rec_dry")
-        if st.button("一键执行：先同步价格，再生成建议", type="primary", use_container_width=True):
+        allow_small_sample = st.toggle("允许小样本建议（<20）", value=True, key="signal_allow_small_sample")
+        dry_sync_then_rec = st.checkbox("一键流程中价格同步 dry-run", value=False, key="signal_sync_dry_run")
+        dry_rec = st.checkbox("仅预览，不写入 Notion（dry-run）", value=True, key="signal_recommend_dry_run")
+        if st.button("一键执行：先同步价格，再生成建议", type="primary", use_container_width=True, key="signal_run_pipeline"):
             sync_args = argparse.Namespace(dry_run=dry_sync_then_rec, timeout=int(timeout))
             sync_code, sync_raw, sync_parsed, sync_err = _run_and_capture(sync_prices, client, cfg, sync_args)
             if sync_err or sync_code != 0:
@@ -562,9 +571,9 @@ def main() -> None:
 
     with tab_backtest:
         st.subheader("回测分析")
-        window = st.number_input("回测窗口（交易事件）", min_value=10, max_value=240, value=60, step=5)
-        allow_small_sample_bt = st.toggle("允许小样本", value=True, key="bt_allow_small")
-        if st.button("执行回测", type="primary", use_container_width=True):
+        window = st.number_input("回测窗口（交易事件）", min_value=10, max_value=240, value=60, step=5, key="backtest_window")
+        allow_small_sample_bt = st.toggle("允许小样本", value=True, key="backtest_allow_small_sample")
+        if st.button("执行回测", type="primary", use_container_width=True, key="backtest_run"):
             bt_args = argparse.Namespace(
                 window=int(window),
                 allow_small_sample=allow_small_sample_bt,
@@ -585,11 +594,11 @@ def main() -> None:
         st.subheader("每日快照与历史趋势")
         today_str = datetime.now().strftime("%Y-%m-%d")
         c1, c2 = st.columns(2)
-        snapshot_date = c1.text_input("快照日期", value=today_str, key="snapshot_date")
-        sync_dry = c2.checkbox("Notion 同步 dry-run", value=True, key="snapshot_notion_dry")
+        snapshot_date = c1.text_input("快照日期", value=today_str, key="history_snapshot_date")
+        sync_dry = c2.checkbox("Notion 同步 dry-run", value=True, key="history_snapshot_sync_dry")
 
         b1, b2 = st.columns(2)
-        if b1.button("手动落库快照", use_container_width=True):
+        if b1.button("手动落库快照", use_container_width=True, key="history_snapshot_save"):
             snap_args = argparse.Namespace(
                 dry_run=False,
                 snapshot_date=snapshot_date,
@@ -610,7 +619,7 @@ def main() -> None:
                 st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
                 _show_json_debug("快照落库结果", raw)
 
-        if b2.button("同步当日快照到 Notion", use_container_width=True):
+        if b2.button("同步当日快照到 Notion", use_container_width=True, key="history_snapshot_sync_notion"):
             sync_args = argparse.Namespace(snapshot_date=snapshot_date, dry_run=sync_dry)
             code, raw, parsed, run_err = _run_and_capture(sync_snapshot_notion, client, cfg, sync_args)
             if run_err or code != 0:
@@ -626,12 +635,22 @@ def main() -> None:
         st.markdown("---")
         st.subheader("历史查询")
         c3, c4 = st.columns(2)
-        start_date = c3.text_input("开始日期", value=today_str, key="hist_start")
-        end_date = c4.text_input("结束日期", value=today_str, key="hist_end")
+        start_date = c3.text_input("开始日期", value=today_str, key="history_query_start")
+        end_date = c4.text_input("结束日期", value=today_str, key="history_query_end")
         c5, c6 = st.columns(2)
-        strategy_filter = c5.multiselect("策略过滤", options=["BASELINE", "CHAN", "ATR_WAVE"], default=[])
-        market_filter = c6.multiselect("市场过滤", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
-        if st.button("查询历史趋势", type="primary", use_container_width=True):
+        strategy_filter = c5.multiselect(
+            "策略过滤",
+            options=["BASELINE", "CHAN", "ATR_WAVE"],
+            default=[],
+            key="history_query_strategy_filter",
+        )
+        market_filter = c6.multiselect(
+            "市场过滤",
+            options=["SH", "SZ", "HK", "US", "OTHER"],
+            default=[],
+            key="history_query_market_filter",
+        )
+        if st.button("查询历史趋势", type="primary", use_container_width=True, key="history_query_run"):
             h_args = argparse.Namespace(
                 start_date=start_date,
                 end_date=end_date,
@@ -656,11 +675,21 @@ def main() -> None:
         pr_start = p1.text_input("推荐开始日期", value=today_str, key="param_start")
         pr_end = p2.text_input("推荐结束日期", value=today_str, key="param_end")
         p3, p4 = st.columns(2)
-        pr_strategies = p3.multiselect("策略", options=["BASELINE", "CHAN", "ATR_WAVE"], default=["BASELINE", "CHAN", "ATR_WAVE"])
-        pr_markets = p4.multiselect("市场", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
+        pr_strategies = p3.multiselect(
+            "策略",
+            options=["BASELINE", "CHAN", "ATR_WAVE"],
+            default=["BASELINE", "CHAN", "ATR_WAVE"],
+            key="param_rec_strategies",
+        )
+        pr_markets = p4.multiselect(
+            "市场",
+            options=["SH", "SZ", "HK", "US", "OTHER"],
+            default=[],
+            key="param_rec_markets",
+        )
         dry_param_rec = st.checkbox("仅预览推荐，不落库", value=False, key="param_rec_dry")
 
-        if st.button("生成推荐参数", type="primary", use_container_width=True):
+        if st.button("生成推荐参数", type="primary", use_container_width=True, key="param_generate"):
             args = argparse.Namespace(
                 start_date=pr_start,
                 end_date=pr_end,
@@ -701,7 +730,7 @@ def main() -> None:
             draft_key = f"param_editor_values_{selected_proposal}"
             if draft_key not in st.session_state:
                 st.session_state[draft_key] = {}
-            if st.button("加载并预检参数差异", use_container_width=True):
+            if st.button("加载并预检参数差异", use_container_width=True, key="param_load_diff"):
                 diff_args = argparse.Namespace(proposal_id=selected_proposal, editor_json=json.dumps(st.session_state[draft_key], ensure_ascii=False))
                 code, raw, parsed, run_err = _run_and_capture(param_diff, diff_args)
                 if run_err or code != 0:
@@ -772,7 +801,7 @@ def main() -> None:
                         gate_max_dd = g3.number_input("最大均值回撤", min_value=0.0, max_value=1.0, value=0.20, step=0.05, key="param_gate_dd")
                         confirm_apply = st.checkbox("我确认应用以上参数变更", value=False, key="param_confirm_apply")
                         ap1, ap2 = st.columns(2)
-                        if ap1.button("应用参数", type="primary", use_container_width=True, disabled=not confirm_apply):
+                        if ap1.button("应用参数", type="primary", use_container_width=True, disabled=not confirm_apply, key="param_apply_button"):
                             apply_args = argparse.Namespace(
                                 proposal_id=selected_proposal,
                                 editor_json=json.dumps(editor_map, ensure_ascii=False),
@@ -799,7 +828,7 @@ def main() -> None:
                                 _show_json_debug("参数应用结果", a_raw)
                         last_apply = st.session_state.get("param_last_apply", {})
                         rollback_id = last_apply.get("apply_log_id", "") if isinstance(last_apply, dict) else ""
-                        if ap2.button("回滚上次应用", use_container_width=True, disabled=not bool(rollback_id)):
+                        if ap2.button("回滚上次应用", use_container_width=True, disabled=not bool(rollback_id), key="param_rollback_button"):
                             roll_args = argparse.Namespace(
                                 apply_log_id=rollback_id,
                                 operator=os.getenv("OPERATOR", "local_user"),
@@ -820,14 +849,24 @@ def main() -> None:
         st.subheader("研究选股（规则+打分）")
         today_str = datetime.now().strftime("%Y-%m-%d")
         s1, s2 = st.columns(2)
-        ss_start = s1.text_input("回看开始日期", value=today_str, key="sel_start")
-        ss_end = s2.text_input("回看结束日期", value=today_str, key="sel_end")
+        ss_start = s1.text_input("回看开始日期", value=today_str, key="select_start_date")
+        ss_end = s2.text_input("回看结束日期", value=today_str, key="select_end_date")
         s3, s4, s5 = st.columns(3)
-        ss_strategy = s3.multiselect("策略过滤", options=["BASELINE", "CHAN", "ATR_WAVE"], default=["BASELINE", "CHAN", "ATR_WAVE"])
-        ss_market = s4.multiselect("市场过滤", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
-        ss_topn = s5.number_input("Top N", min_value=1, max_value=50, value=10, step=1)
-        ss_min_samples = st.number_input("最小样本数", min_value=1, max_value=60, value=5, step=1)
-        if st.button("执行选股打分", type="primary", use_container_width=True):
+        ss_strategy = s3.multiselect(
+            "策略过滤",
+            options=["BASELINE", "CHAN", "ATR_WAVE"],
+            default=["BASELINE", "CHAN", "ATR_WAVE"],
+            key="select_filter_strategy",
+        )
+        ss_market = s4.multiselect(
+            "市场过滤",
+            options=["SH", "SZ", "HK", "US", "OTHER"],
+            default=[],
+            key="select_filter_market",
+        )
+        ss_topn = s5.number_input("Top N", min_value=1, max_value=50, value=10, step=1, key="select_top_n")
+        ss_min_samples = st.number_input("最小样本数", min_value=1, max_value=60, value=5, step=1, key="select_min_samples")
+        if st.button("执行选股打分", type="primary", use_container_width=True, key="select_run"):
             sel_args = argparse.Namespace(
                 start_date=ss_start,
                 end_date=ss_end,
@@ -857,8 +896,8 @@ def main() -> None:
 
     with tab_health:
         st.subheader("系统健康")
-        days = st.number_input("统计窗口（天）", min_value=1, max_value=30, value=7, step=1)
-        if st.button("刷新健康指标", type="primary", use_container_width=True):
+        days = st.number_input("统计窗口（天）", min_value=1, max_value=30, value=7, step=1, key="health_days")
+        if st.button("刷新健康指标", type="primary", use_container_width=True, key="health_refresh"):
             mon_args = argparse.Namespace(days=int(days))
             code, raw, parsed, run_err = _run_and_capture(param_monitor, mon_args)
             if run_err or code != 0:
