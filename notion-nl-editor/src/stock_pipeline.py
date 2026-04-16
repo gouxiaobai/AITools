@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import requests
 from requests import exceptions as req_exc
-from param_store import ParamStore
+from param_store import ParamStore, SCHEMA_VERSION
 
 
 def load_dotenv(path: str) -> None:
@@ -3078,6 +3078,134 @@ def history_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_experiment_baseline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = _history_payload(rows)
+    return {
+        "summary": payload.get("summary", {}),
+        "by_strategy": payload.get("by_strategy", []),
+        "by_market": payload.get("by_market", []),
+    }
+
+
+def _gate_decision(proposal: Dict[str, Any], args: argparse.Namespace, expected_experiment_id: str = "") -> Tuple[bool, str, Dict[str, Any]]:
+    validation = proposal.get("validation", {}) if isinstance(proposal.get("validation", {}), dict) else {}
+    stability = float(validation.get("stability", 0.0) or 0.0)
+    hit_rate = float(proposal.get("hit_rate", 0.0) or 0.0)
+    dd_mean = float(proposal.get("dd_mean", 0.0) or 0.0)
+    min_stability = float(getattr(args, "gate_min_stability", 0.0) or 0.0)
+    min_hit_rate = float(getattr(args, "gate_min_hit_rate", 0.0) or 0.0)
+    max_dd_mean = float(getattr(args, "gate_max_dd_mean", 1.0) or 1.0)
+    require_experiment = bool(getattr(args, "require_experiment", False))
+    proposal_exp = (proposal.get("experiment_id", "") or "").strip()
+    expected_exp = (expected_experiment_id or "").strip()
+    reasons: List[str] = []
+
+    if require_experiment and not (proposal_exp or expected_exp):
+        reasons.append("missing experiment id")
+    if expected_exp and proposal_exp and expected_exp != proposal_exp:
+        reasons.append(f"experiment mismatch: proposal={proposal_exp} expected={expected_exp}")
+    if stability < min_stability:
+        reasons.append(f"stability={stability:.4f} < {min_stability:.4f}")
+    if hit_rate < min_hit_rate:
+        reasons.append(f"hit_rate={hit_rate:.4f} < {min_hit_rate:.4f}")
+    if dd_mean > max_dd_mean:
+        reasons.append(f"dd_mean={dd_mean:.4f} > {max_dd_mean:.4f}")
+
+    gate = {
+        "require_experiment": require_experiment,
+        "proposal_experiment_id": proposal_exp,
+        "expected_experiment_id": expected_exp,
+        "stability": stability,
+        "hit_rate": hit_rate,
+        "dd_mean": dd_mean,
+        "min_stability": min_stability,
+        "min_hit_rate": min_hit_rate,
+        "max_dd_mean": max_dd_mean,
+    }
+    return len(reasons) == 0, "; ".join(reasons), gate
+
+
+def _minmax_scale(values: List[float]) -> List[float]:
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    if hi - lo < 1e-12:
+        return [0.5 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _score_selected_rows(rows: List[Dict[str, Any]], top_n: int) -> Dict[str, Any]:
+    by_stock: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_stock[str(row.get("stock_id", ""))].append(row)
+
+    scored: List[Dict[str, Any]] = []
+    for stock_id, items in by_stock.items():
+        if not stock_id:
+            continue
+        returns = [float(x.get("ret_1d", 0.0) or 0.0) for x in items]
+        hit_vals = [float(x.get("hit_flag", 0) or 0.0) for x in items]
+        dd_vals = [float(x.get("max_drawdown", 0.0) or 0.0) for x in items]
+        sample = len(items)
+        mean_ret = _safe_mean(returns) if returns else 0.0
+        momentum_5 = _safe_mean(returns[-5:]) if returns else 0.0
+        hit_rate = _safe_mean(hit_vals) if hit_vals else 0.0
+        dd_mean = _safe_mean(dd_vals) if dd_vals else 0.0
+        vol = _safe_stdev(returns) if len(returns) > 1 else 0.0
+        latest = items[-1]
+        scored.append(
+            {
+                "stock_id": stock_id,
+                "stock_code": latest.get("stock_code", ""),
+                "stock_name": latest.get("stock_name", ""),
+                "market": latest.get("market", ""),
+                "sample_count": sample,
+                "mean_ret": mean_ret,
+                "momentum_5": momentum_5,
+                "hit_rate": hit_rate,
+                "dd_mean": dd_mean,
+                "vol": vol,
+            }
+        )
+
+    if not scored:
+        return {"candidates": [], "selected": [], "rebalance_plan": []}
+
+    momentum_scaled = _minmax_scale([x["momentum_5"] for x in scored])
+    hit_scaled = _minmax_scale([x["hit_rate"] for x in scored])
+    dd_scaled = _minmax_scale([-x["dd_mean"] for x in scored])
+    vol_scaled = _minmax_scale([-x["vol"] for x in scored])
+
+    for idx, row in enumerate(scored):
+        score = momentum_scaled[idx] * 0.35 + hit_scaled[idx] * 0.30 + dd_scaled[idx] * 0.20 + vol_scaled[idx] * 0.15
+        row["score"] = round(score, 6)
+        row["factor_breakdown"] = {
+            "momentum_5": round(momentum_scaled[idx], 6),
+            "hit_rate": round(hit_scaled[idx], 6),
+            "drawdown_quality": round(dd_scaled[idx], 6),
+            "vol_quality": round(vol_scaled[idx], 6),
+        }
+
+    ranked = sorted(scored, key=lambda x: (x["score"], x["sample_count"]), reverse=True)
+    selected = ranked[: max(1, int(top_n))]
+    score_sum = sum(max(0.0, float(x["score"])) for x in selected)
+    rebalance: List[Dict[str, Any]] = []
+    for row in selected:
+        target_weight = (max(0.0, float(row["score"])) / score_sum) if score_sum > 0 else (1.0 / float(len(selected)))
+        rebalance.append(
+            {
+                "stock_id": row["stock_id"],
+                "stock_code": row["stock_code"],
+                "stock_name": row["stock_name"],
+                "target_weight": round(target_weight, 6),
+                "score": row["score"],
+            }
+        )
+
+    return {"candidates": ranked, "selected": selected, "rebalance_plan": rebalance}
+
+
 def param_recommend(args: argparse.Namespace) -> int:
     started = _now_ms()
     start_date = _today_or(getattr(args, "start_date", ""))
@@ -3093,8 +3221,30 @@ def param_recommend(args: argparse.Namespace) -> int:
             snap.close()
 
         run_id = uuid4().hex[:12]
+        experiment_id = (getattr(args, "experiment_id", "") or "").strip()
+        experiment_name = (getattr(args, "experiment_name", "") or "").strip()
         store = ParamStore(_sqlite_path())
         try:
+            strategies_scope = ",".join(strategies) if strategies else "*"
+            markets_scope = ",".join(markets) if markets else "*"
+            if not experiment_id:
+                exp = store.create_experiment(
+                    source_start_date=start_date,
+                    source_end_date=end_date,
+                    strategy_scope=strategies_scope,
+                    market_scope=markets_scope,
+                    walk_forward_splits=int(getattr(args, "walk_forward_splits", 3)),
+                    cost_bps=float(getattr(args, "cost_bps", 3.0)),
+                    slippage_bps=float(getattr(args, "slippage_bps", 2.0)),
+                    train_window=int(getattr(args, "train_window", 60)),
+                    valid_window=int(getattr(args, "valid_window", 20)),
+                    experiment_name=experiment_name,
+                    baseline=_build_experiment_baseline(rows),
+                )
+                experiment_id = str(exp.get("experiment_id", ""))
+            else:
+                _ = store.get_experiment(experiment_id)
+
             out_rows = store.create_proposals_from_history(
                 snapshot_rows=rows,
                 source_start_date=start_date,
@@ -3104,6 +3254,20 @@ def param_recommend(args: argparse.Namespace) -> int:
                 walk_forward_splits=int(getattr(args, "walk_forward_splits", 3)),
                 cost_bps=float(getattr(args, "cost_bps", 3.0)),
                 slippage_bps=float(getattr(args, "slippage_bps", 2.0)),
+                experiment_id=experiment_id,
+            )
+            store.update_experiment_report(
+                experiment_id=experiment_id,
+                report={
+                    "run_id": run_id,
+                    "proposal_count": len(out_rows),
+                    "source_start_date": start_date,
+                    "source_end_date": end_date,
+                    "dry_run": bool(getattr(args, "dry_run", False)),
+                    "strategies": strategies,
+                    "markets": markets,
+                },
+                status="READY",
             )
         finally:
             store.close()
@@ -3111,6 +3275,7 @@ def param_recommend(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
+                    "experiment_id": experiment_id,
                     "run_id": run_id,
                     "source_start_date": start_date,
                     "source_end_date": end_date,
@@ -3126,7 +3291,7 @@ def param_recommend(args: argparse.Namespace) -> int:
             action="param_recommend",
             status="SUCCESS",
             started_ms=started,
-            meta={"proposal_count": len(out_rows), "dry_run": bool(getattr(args, "dry_run", False))},
+            meta={"proposal_count": len(out_rows), "dry_run": bool(getattr(args, "dry_run", False)), "experiment_id": experiment_id},
             run_id=run_id,
         )
         return 0
@@ -3187,10 +3352,16 @@ def param_apply(args: argparse.Namespace) -> int:
     expected_version = int(getattr(args, "expected_version", -1))
     batch_id = (getattr(args, "batch_id", "") or "").strip()
     rollout_scope = (getattr(args, "rollout_scope", "") or getattr(args, "gray_scope", "") or "full").strip() or "full"
+    experiment_id = (getattr(args, "experiment_id", "") or "").strip()
 
     try:
         store = ParamStore(_sqlite_path())
         try:
+            proposal = store.get_proposal(proposal_id)
+            gate_passed, gate_reason, gate_payload = _gate_decision(proposal, args=args, expected_experiment_id=experiment_id)
+            if not gate_passed:
+                raise RuntimeError(f"release gate blocked: {gate_reason}")
+            effective_experiment_id = experiment_id or str(proposal.get("experiment_id", "") or "")
             out = store.apply(
                 proposal_id=proposal_id,
                 editor_values=editor_values or None,
@@ -3199,6 +3370,9 @@ def param_apply(args: argparse.Namespace) -> int:
                 expected_version=expected_version if expected_version >= 0 else None,
                 batch_id=batch_id,
                 rollout_scope=rollout_scope,
+                experiment_id=effective_experiment_id,
+                gate_passed=gate_passed,
+                gate_reason=gate_reason,
             )
         finally:
             store.close()
@@ -3207,7 +3381,13 @@ def param_apply(args: argparse.Namespace) -> int:
             action="param_apply",
             status="SUCCESS",
             started_ms=started,
-            meta={"changed_count": int(out.get("changed_count", 0)), "batch_id": batch_id, "rollout_scope": rollout_scope},
+            meta={
+                "changed_count": int(out.get("changed_count", 0)),
+                "batch_id": batch_id,
+                "rollout_scope": rollout_scope,
+                "experiment_id": str(out.get("experiment_id", "")),
+                "gate": gate_payload,
+            },
             proposal_id=proposal_id,
             apply_log_id=str(out.get("apply_log_id", "")),
         )
@@ -3217,9 +3397,9 @@ def param_apply(args: argparse.Namespace) -> int:
             action="param_apply",
             status="FAILED",
             started_ms=started,
-            meta={"batch_id": batch_id, "rollout_scope": rollout_scope},
+            meta={"batch_id": batch_id, "rollout_scope": rollout_scope, "experiment_id": experiment_id},
             proposal_id=proposal_id,
-            error_code="PARAM_APPLY_FAILED",
+            error_code="PARAM_APPLY_CONFLICT" if "version conflict" in str(e).lower() else "PARAM_APPLY_FAILED",
             error_msg=str(e),
         )
         raise
@@ -3289,6 +3469,177 @@ def param_monitor(args: argparse.Namespace) -> int:
     finally:
         store.close()
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def param_migrate(args: argparse.Namespace) -> int:
+    db_path = _sqlite_path()
+    before = 0
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
+            if row and row[0] is not None:
+                before = int(row[0])
+        except Exception:
+            before = 0
+        finally:
+            conn.close()
+    store = ParamStore(db_path)
+    try:
+        after = store.get_schema_version()
+        required_tables = [
+            "_meta",
+            "strategy_param_set",
+            "strategy_param_proposal",
+            "strategy_param_apply_log",
+            "strategy_param_draft",
+            "strategy_run_event",
+            "strategy_research_experiment",
+        ]
+        exists = {}
+        for t in required_tables:
+            row = store.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+            exists[t] = bool(row)
+    finally:
+        store.close()
+    print(
+        json.dumps(
+            {
+                "sqlite_path": db_path,
+                "schema_version_before": before,
+                "schema_version_after": after,
+                "schema_version_target": SCHEMA_VERSION,
+                "tables": exists,
+                "ok": after >= SCHEMA_VERSION and all(bool(v) for v in exists.values()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def param_risk_guard(args: argparse.Namespace) -> int:
+    started = _now_ms()
+    days = max(1, int(getattr(args, "days", 7) or 7))
+    apply_lookback_days = max(days, int(getattr(args, "apply_lookback_days", 30) or 30))
+    min_hit_rate = float(getattr(args, "min_hit_rate", 0.45) or 0.45)
+    max_drawdown_curve = float(getattr(args, "max_drawdown_curve", 0.2) or 0.2)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    end_date = dt.date.today().isoformat()
+    start_date = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    snap = SnapshotStore(_sqlite_path())
+    try:
+        rows = snap.query_range(start_date=start_date, end_date=end_date)
+    finally:
+        snap.close()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = f"{str(row.get('strategy_id', '')).upper()}|{str(row.get('market', '')).upper()}"
+        grouped[key].append(row)
+
+    stat: Dict[str, Dict[str, float]] = {}
+    for key, items in grouped.items():
+        hit_vals = [float(x.get("hit_flag", 0) or 0.0) for x in items]
+        by_day: Dict[str, List[float]] = defaultdict(list)
+        for x in items:
+            by_day[str(x.get("snapshot_date", ""))].append(float(x.get("ret_1d", 0.0) or 0.0))
+        day_mean = [(_safe_mean(arr) if arr else 0.0) for _, arr in sorted(by_day.items())]
+        stat[key] = {
+            "hit_rate": _safe_mean(hit_vals) if hit_vals else 0.0,
+            "drawdown_curve": _max_drawdown(day_mean) if day_mean else 0.0,
+            "sample_count": float(len(items)),
+        }
+
+    store = ParamStore(_sqlite_path())
+    actions: List[Dict[str, Any]] = []
+    try:
+        candidates = store.list_recent_applies(days=apply_lookback_days)
+        for row in candidates:
+            sid = str(row.get("strategy_id", "")).upper()
+            market = str(row.get("market", "")).upper()
+            key = f"{sid}|{market}"
+            s = stat.get(key, {"hit_rate": 0.0, "drawdown_curve": 0.0, "sample_count": 0.0})
+            breached = []
+            if float(s.get("hit_rate", 0.0)) < min_hit_rate:
+                breached.append(f"hit_rate={float(s.get('hit_rate', 0.0)):.4f} < {min_hit_rate:.4f}")
+            if float(s.get("drawdown_curve", 0.0)) > max_drawdown_curve:
+                breached.append(f"drawdown_curve={float(s.get('drawdown_curve', 0.0)):.4f} > {max_drawdown_curve:.4f}")
+            if not breached:
+                continue
+            apply_log_id = str(row.get("apply_log_id", ""))
+            action = {
+                "apply_log_id": apply_log_id,
+                "strategy_id": sid,
+                "market": market,
+                "breach": breached,
+                "dry_run": dry_run,
+                "rolled_back": False,
+            }
+            if not dry_run and apply_log_id:
+                rb = store.rollback(apply_log_id=apply_log_id, operator="risk_guard", comment="auto rollback by param-risk-guard")
+                action["rolled_back"] = True
+                action["rollback_apply_log_id"] = rb.get("apply_log_id")
+            actions.append(action)
+    finally:
+        store.close()
+
+    out = {
+        "window_days": days,
+        "apply_lookback_days": apply_lookback_days,
+        "min_hit_rate": min_hit_rate,
+        "max_drawdown_curve": max_drawdown_curve,
+        "dry_run": dry_run,
+        "candidate_count": len(actions),
+        "actions": actions,
+    }
+    _log_param_event(
+        action="param_risk_guard",
+        status="SUCCESS",
+        started_ms=started,
+        meta={"candidate_count": len(actions), "dry_run": dry_run, "days": days},
+    )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def select_stock(args: argparse.Namespace) -> int:
+    start_date = _today_or(getattr(args, "start_date", "")) if getattr(args, "start_date", "") else (dt.date.today() - dt.timedelta(days=60)).isoformat()
+    end_date = _today_or(getattr(args, "end_date", "")) if getattr(args, "end_date", "") else dt.date.today().isoformat()
+    strategies = [x.upper() for x in _split_csv(getattr(args, "strategies", ""))]
+    markets = [x.upper() for x in _split_csv(getattr(args, "markets", ""))]
+    top_n = max(1, int(getattr(args, "top_n", 10) or 10))
+    min_samples = max(1, int(getattr(args, "min_samples", 5) or 5))
+
+    snap = SnapshotStore(_sqlite_path())
+    try:
+        rows = snap.query_range(start_date=start_date, end_date=end_date, strategies=strategies or None, markets=markets or None)
+    finally:
+        snap.close()
+    rows = [r for r in rows if int(r.get("sample_count", 0) or 0) >= min_samples]
+    score_out = _score_selected_rows(rows, top_n=top_n)
+    print(
+        json.dumps(
+            {
+                "start_date": start_date,
+                "end_date": end_date,
+                "strategy_filter": strategies,
+                "market_filter": markets,
+                "min_samples": min_samples,
+                "top_n": top_n,
+                "candidate_count": len(score_out.get("candidates", [])),
+                "selected_count": len(score_out.get("selected", [])),
+                "selected": score_out.get("selected", []),
+                "rebalance_plan": score_out.get("rebalance_plan", []),
+                "candidates": score_out.get("candidates", []),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -3515,6 +3866,10 @@ def build_parser() -> argparse.ArgumentParser:
     s_pr.add_argument("--walk-forward-splits", type=int, default=3, help="walk-forward 分窗数量")
     s_pr.add_argument("--cost-bps", type=float, default=3.0, help="交易成本bps")
     s_pr.add_argument("--slippage-bps", type=float, default=2.0, help="滑点bps")
+    s_pr.add_argument("--experiment-id", default="", help="绑定已有实验ID；留空则自动创建")
+    s_pr.add_argument("--experiment-name", default="", help="实验名称（自动创建时生效）")
+    s_pr.add_argument("--train-window", type=int, default=60, help="实验训练窗口（交易日）")
+    s_pr.add_argument("--valid-window", type=int, default=20, help="实验验证窗口（交易日）")
 
     s_pd = sub.add_parser("param-diff", help="比较当前值、推荐值、人工编辑值")
     s_pd.add_argument("--proposal-id", required=True, help="参数推荐ID")
@@ -3529,6 +3884,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_pa.add_argument("--batch-id", default="", help="发布批次ID")
     s_pa.add_argument("--rollout-scope", default="full", help="灰度范围，如 full/market:SH/strategy:BASELINE")
     s_pa.add_argument("--gray-scope", default="", help="兼容旧参数名，等价于 --rollout-scope")
+    s_pa.add_argument("--experiment-id", default="", help="发布闸门绑定实验ID")
+    s_pa.add_argument("--require-experiment", action="store_true", help="发布必须绑定实验ID")
+    s_pa.add_argument("--gate-min-stability", type=float, default=0.0, help="发布闸门：最小稳定性")
+    s_pa.add_argument("--gate-min-hit-rate", type=float, default=0.0, help="发布闸门：最小命中率")
+    s_pa.add_argument("--gate-max-dd-mean", type=float, default=1.0, help="发布闸门：最大平均回撤")
 
     s_proll = sub.add_parser("param-rollback", help="按 apply_log_id 回滚参数")
     s_proll.add_argument("--apply-log-id", required=True, help="apply_log_id")
@@ -3541,6 +3901,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     s_pmon = sub.add_parser("param-monitor", help="输出参数系统健康与最近异常")
     s_pmon.add_argument("--days", type=int, default=7, help="统计窗口天数")
+
+    sub.add_parser("param-migrate", help="执行参数系统Schema迁移并输出校验结果")
+
+    s_prg = sub.add_parser("param-risk-guard", help="风险守护：命中率/回撤劣化自动回滚")
+    s_prg.add_argument("--days", type=int, default=7, help="观察窗口天数")
+    s_prg.add_argument("--apply-lookback-days", type=int, default=30, help="回看最近应用窗口天数")
+    s_prg.add_argument("--min-hit-rate", type=float, default=0.45, help="最小命中率阈值")
+    s_prg.add_argument("--max-drawdown-curve", type=float, default=0.2, help="最大回撤阈值")
+    s_prg.add_argument("--dry-run", action="store_true", help="仅预览，不执行回滚")
+
+    s_ss = sub.add_parser("select-stock", help="规则打分选股并输出调仓建议")
+    s_ss.add_argument("--start-date", default="", help="开始日期，默认今天往前60天")
+    s_ss.add_argument("--end-date", default="", help="结束日期，默认今天")
+    s_ss.add_argument("--strategies", default="", help="策略过滤，如 BASELINE,CHAN")
+    s_ss.add_argument("--markets", default="", help="市场过滤，如 SH,SZ,HK")
+    s_ss.add_argument("--top-n", type=int, default=10, help="输出Top N")
+    s_ss.add_argument("--min-samples", type=int, default=5, help="最小样本数过滤")
 
     return p
 def main() -> int:
@@ -3565,6 +3942,12 @@ def main() -> int:
         return param_draft_save(args)
     if args.cmd == "param-monitor":
         return param_monitor(args)
+    if args.cmd == "param-migrate":
+        return param_migrate(args)
+    if args.cmd == "param-risk-guard":
+        return param_risk_guard(args)
+    if args.cmd == "select-stock":
+        return select_stock(args)
 
     if not args.token:
         print("Missing NOTION_TOKEN.", file=sys.stderr)

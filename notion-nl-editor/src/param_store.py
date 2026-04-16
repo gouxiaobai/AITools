@@ -7,7 +7,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 PARAM_SCHEMA: Dict[str, Dict[str, Any]] = {
     "band_low": {"type": "number", "min": 0.005, "max": 0.2, "step": 0.001},
@@ -205,10 +205,47 @@ class ParamStore:
             """)
             current = 2
 
+        if current < 3:
+            self._ensure_column("strategy_param_proposal", "experiment_id", "TEXT")
+            self._ensure_column("strategy_param_proposal", "sample_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("strategy_param_proposal", "hit_rate", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column("strategy_param_proposal", "mean_ret", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column("strategy_param_proposal", "dd_mean", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column("strategy_param_apply_log", "experiment_id", "TEXT")
+            self._ensure_column("strategy_param_apply_log", "gate_passed", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column("strategy_param_apply_log", "gate_reason", "TEXT NOT NULL DEFAULT ''")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_research_experiment (
+                    experiment_id TEXT PRIMARY KEY,
+                    experiment_name TEXT NOT NULL,
+                    strategy_scope TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    source_start_date TEXT NOT NULL,
+                    source_end_date TEXT NOT NULL,
+                    train_window INTEGER NOT NULL,
+                    valid_window INTEGER NOT NULL,
+                    walk_forward_splits INTEGER NOT NULL,
+                    cost_bps REAL NOT NULL,
+                    slippage_bps REAL NOT NULL,
+                    baseline_json TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            current = 3
+
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_proposal ON strategy_param_apply_log (proposal_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_hash ON strategy_param_apply_log (proposal_id, payload_hash)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_proposal_created ON strategy_param_proposal (created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_proposal_experiment ON strategy_param_proposal (experiment_id, created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_status_created ON strategy_param_apply_log (status, created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_param_apply_experiment ON strategy_param_apply_log (experiment_id, created_at DESC)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_run_event_created ON strategy_run_event (created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_experiment_created ON strategy_research_experiment (created_at DESC)")
         self.conn.execute("INSERT INTO _meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(current),))
         self.conn.commit()
 
@@ -276,7 +313,7 @@ class ParamStore:
     def get_params(self, strategy_id: str, market: str, symbol_scope: str = "*") -> Dict[str, Any]:
         return self.get_active_param_set(strategy_id=strategy_id, market=market, symbol_scope=symbol_scope).get("params", {})
 
-    def create_proposals_from_history(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0) -> List[Dict[str, Any]]:
+    def create_proposals_from_history(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0, experiment_id: str = "") -> List[Dict[str, Any]]:
         buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for row in snapshot_rows:
             key = (_norm_strategy(str(row.get("strategy_id", ""))), str(row.get("market", "OTHER")).upper())
@@ -334,6 +371,7 @@ class ParamStore:
                 "source_start_date": source_start_date,
                 "source_end_date": source_end_date,
                 "run_id": run_id,
+                "experiment_id": experiment_id or "",
                 "created_at": _now(),
                 "sample_count": len(items),
                 "hit_rate": round(hit_rate, 6),
@@ -351,8 +389,9 @@ class ParamStore:
                         INSERT INTO strategy_param_proposal(
                             proposal_id, strategy_id, market, symbol_scope, base_version,
                             current_params_json, proposed_params_json, score,
-                            source_start_date, source_end_date, run_id, created_at, validation_json
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            source_start_date, source_end_date, run_id, created_at, validation_json,
+                            experiment_id, sample_count, hit_rate, mean_ret, dd_mean
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             row["proposal_id"], row["strategy_id"], row["market"], row["symbol_scope"], row["base_version"],
@@ -360,11 +399,16 @@ class ParamStore:
                             json.dumps(row["proposed_params"], ensure_ascii=False, sort_keys=True),
                             row["score"], row["source_start_date"], row["source_end_date"], row["run_id"], row["created_at"],
                             json.dumps(row["validation"], ensure_ascii=False, sort_keys=True),
+                            row.get("experiment_id", "") or None,
+                            int(row.get("sample_count", 0) or 0),
+                            float(row.get("hit_rate", 0.0) or 0.0),
+                            float(row.get("mean_ret", 0.0) or 0.0),
+                            float(row.get("dd_mean", 0.0) or 0.0),
                         ),
                     )
         return out
 
-    def create_proposals(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0) -> List[Dict[str, Any]]:
+    def create_proposals(self, snapshot_rows: List[Dict[str, Any]], source_start_date: str, source_end_date: str, run_id: str, symbol_scope: str = "*", dry_run: bool = False, walk_forward_splits: int = 3, cost_bps: float = 3.0, slippage_bps: float = 2.0, experiment_id: str = "") -> List[Dict[str, Any]]:
         return self.create_proposals_from_history(
             snapshot_rows=snapshot_rows,
             source_start_date=source_start_date,
@@ -375,6 +419,7 @@ class ParamStore:
             walk_forward_splits=walk_forward_splits,
             cost_bps=cost_bps,
             slippage_bps=slippage_bps,
+            experiment_id=experiment_id,
         )
 
     def get_proposal(self, proposal_id: str) -> Dict[str, Any]:
@@ -393,7 +438,12 @@ class ParamStore:
             "source_start_date": row["source_start_date"],
             "source_end_date": row["source_end_date"],
             "run_id": row["run_id"],
+            "experiment_id": row["experiment_id"] if "experiment_id" in row.keys() else None,
             "created_at": row["created_at"],
+            "sample_count": int(row["sample_count"]) if "sample_count" in row.keys() else 0,
+            "hit_rate": float(row["hit_rate"]) if "hit_rate" in row.keys() else 0.0,
+            "mean_ret": float(row["mean_ret"]) if "mean_ret" in row.keys() else 0.0,
+            "dd_mean": float(row["dd_mean"]) if "dd_mean" in row.keys() else 0.0,
             "validation": json.loads(row["validation_json"] or "{}"),
         }
 
@@ -471,7 +521,7 @@ class ParamStore:
             "validation": proposal.get("validation", {}),
         }
 
-    def apply(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "full") -> Dict[str, Any]:
+    def apply(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "full", experiment_id: str = "", gate_passed: bool = True, gate_reason: str = "") -> Dict[str, Any]:
         diff = self.diff(proposal_id, editor_values=editor_values or {})
         if diff["warnings"]:
             raise RuntimeError(f"validation failed: {'; '.join(diff['warnings'])}")
@@ -493,7 +543,7 @@ class ParamStore:
             (proposal_id, ph),
         ).fetchone()
         if existing:
-            return {"apply_log_id": existing["apply_log_id"], "changed_count": 0, "skipped_count": len(PARAM_SCHEMA), "warnings": ["idempotent replay"], "idempotent": True, "version": current_version, "batch_id": batch_id, "rollout_scope": rollout_scope}
+            return {"apply_log_id": existing["apply_log_id"], "changed_count": 0, "skipped_count": len(PARAM_SCHEMA), "warnings": ["idempotent replay"], "idempotent": True, "version": current_version, "batch_id": batch_id, "rollout_scope": rollout_scope, "experiment_id": experiment_id or proposal.get("experiment_id"), "gate_passed": bool(gate_passed), "gate_reason": gate_reason}
 
         changed_count = sum(1 for k in PARAM_SCHEMA.keys() if current_params.get(k) != final_payload.get(k))
         skipped_count = len(PARAM_SCHEMA) - changed_count
@@ -507,8 +557,8 @@ class ParamStore:
                     apply_log_id, proposal_id, strategy_id, market, symbol_scope,
                     old_params_json, new_params_json, operator, comment, payload_hash,
                     changed_count, skipped_count, warnings_json, rollback_ref, created_at,
-                    batch_id, rollout_scope, status
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    batch_id, rollout_scope, status, experiment_id, gate_passed, gate_reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     apply_log_id,
@@ -529,11 +579,14 @@ class ParamStore:
                     batch_id or None,
                     rollout_scope,
                     "APPLIED",
+                    experiment_id or proposal.get("experiment_id") or None,
+                    1 if gate_passed else 0,
+                    gate_reason or "",
                 ),
             )
-        return {"apply_log_id": apply_log_id, "changed_count": changed_count, "skipped_count": skipped_count, "warnings": [], "idempotent": False, "version": new_version, "batch_id": batch_id, "rollout_scope": rollout_scope}
+        return {"apply_log_id": apply_log_id, "changed_count": changed_count, "skipped_count": skipped_count, "warnings": [], "idempotent": False, "version": new_version, "batch_id": batch_id, "rollout_scope": rollout_scope, "experiment_id": experiment_id or proposal.get("experiment_id"), "gate_passed": bool(gate_passed), "gate_reason": gate_reason}
 
-    def apply_proposal(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "", gray_scope: str = "") -> Dict[str, Any]:
+    def apply_proposal(self, proposal_id: str, editor_values: Optional[Dict[str, Any]] = None, operator: str = "local_user", comment: str = "", expected_version: Optional[int] = None, batch_id: str = "", rollout_scope: str = "", gray_scope: str = "", experiment_id: str = "", gate_passed: bool = True, gate_reason: str = "") -> Dict[str, Any]:
         effective_rollout_scope = (rollout_scope or gray_scope or "full").strip() or "full"
         return self.apply(
             proposal_id=proposal_id,
@@ -543,6 +596,9 @@ class ParamStore:
             expected_version=expected_version,
             batch_id=batch_id,
             rollout_scope=effective_rollout_scope,
+            experiment_id=experiment_id,
+            gate_passed=gate_passed,
+            gate_reason=gate_reason,
         )
 
     def rollback(self, apply_log_id: str, operator: str = "local_user", comment: str = "") -> Dict[str, Any]:
@@ -566,8 +622,8 @@ class ParamStore:
                     apply_log_id, proposal_id, strategy_id, market, symbol_scope,
                     old_params_json, new_params_json, operator, comment, payload_hash,
                     changed_count, skipped_count, warnings_json, rollback_ref, created_at,
-                    batch_id, rollout_scope, status
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    batch_id, rollout_scope, status, experiment_id, gate_passed, gate_reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rollback_apply_id,
@@ -588,12 +644,122 @@ class ParamStore:
                     row["batch_id"],
                     row["rollout_scope"],
                     "ROLLED_BACK",
+                    row["experiment_id"] if "experiment_id" in row.keys() else None,
+                    1,
+                    f"rollback from {apply_log_id}",
                 ),
             )
         return {"apply_log_id": rollback_apply_id, "rollback_ref": apply_log_id, "changed_count": changed_count, "skipped_count": len(PARAM_SCHEMA) - changed_count, "warnings": [], "version": new_version}
 
     def rollback_apply(self, apply_log_id: str, operator: str = "local_user", comment: str = "") -> Dict[str, Any]:
         return self.rollback(apply_log_id=apply_log_id, operator=operator, comment=comment)
+
+    def create_experiment(self, source_start_date: str, source_end_date: str, strategy_scope: str, market_scope: str, walk_forward_splits: int, cost_bps: float, slippage_bps: float, train_window: int, valid_window: int, experiment_name: str = "", baseline: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        experiment_id = uuid4().hex[:12]
+        now = _now()
+        row = {
+            "experiment_id": experiment_id,
+            "experiment_name": (experiment_name or f"exp_{source_start_date}_{source_end_date}")[:120],
+            "strategy_scope": strategy_scope or "*",
+            "market_scope": market_scope or "*",
+            "source_start_date": source_start_date,
+            "source_end_date": source_end_date,
+            "train_window": max(1, int(train_window)),
+            "valid_window": max(1, int(valid_window)),
+            "walk_forward_splits": max(1, int(walk_forward_splits)),
+            "cost_bps": float(cost_bps),
+            "slippage_bps": float(slippage_bps),
+            "baseline": baseline or {},
+            "report": {},
+            "status": "CREATED",
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_research_experiment(
+                    experiment_id, experiment_name, strategy_scope, market_scope,
+                    source_start_date, source_end_date, train_window, valid_window,
+                    walk_forward_splits, cost_bps, slippage_bps, baseline_json, report_json,
+                    status, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    row["experiment_id"],
+                    row["experiment_name"],
+                    row["strategy_scope"],
+                    row["market_scope"],
+                    row["source_start_date"],
+                    row["source_end_date"],
+                    row["train_window"],
+                    row["valid_window"],
+                    row["walk_forward_splits"],
+                    row["cost_bps"],
+                    row["slippage_bps"],
+                    json.dumps(row["baseline"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(row["report"], ensure_ascii=False, sort_keys=True),
+                    row["status"],
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
+        return row
+
+    def update_experiment_report(self, experiment_id: str, report: Dict[str, Any], status: str = "READY") -> Dict[str, Any]:
+        now = _now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE strategy_research_experiment SET report_json=?, status=?, updated_at=? WHERE experiment_id=?",
+                (json.dumps(report or {}, ensure_ascii=False, sort_keys=True), status, now, experiment_id),
+            )
+        return self.get_experiment(experiment_id)
+
+    def get_experiment(self, experiment_id: str) -> Dict[str, Any]:
+        row = self.conn.execute("SELECT * FROM strategy_research_experiment WHERE experiment_id=?", (experiment_id,)).fetchone()
+        if not row:
+            raise RuntimeError(f"experiment not found: {experiment_id}")
+        return {
+            "experiment_id": row["experiment_id"],
+            "experiment_name": row["experiment_name"],
+            "strategy_scope": row["strategy_scope"],
+            "market_scope": row["market_scope"],
+            "source_start_date": row["source_start_date"],
+            "source_end_date": row["source_end_date"],
+            "train_window": int(row["train_window"]),
+            "valid_window": int(row["valid_window"]),
+            "walk_forward_splits": int(row["walk_forward_splits"]),
+            "cost_bps": float(row["cost_bps"]),
+            "slippage_bps": float(row["slippage_bps"]),
+            "baseline": json.loads(row["baseline_json"] or "{}"),
+            "report": json.loads(row["report_json"] or "{}"),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_experiments(self, limit: int = 50) -> List[Dict[str, Any]]:
+        cur = self.conn.execute(
+            "SELECT experiment_id, experiment_name, strategy_scope, market_scope, source_start_date, source_end_date, status, updated_at FROM strategy_research_experiment ORDER BY updated_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(x) for x in cur]
+
+    def list_recent_applies(self, days: int = 7) -> List[Dict[str, Any]]:
+        cutoff = (dt.datetime.now() - dt.timedelta(days=max(1, int(days)))).isoformat(timespec="seconds")
+        rows = self.conn.execute(
+            """
+            SELECT * FROM strategy_param_apply_log
+            WHERE created_at >= ? AND status='APPLIED'
+              AND apply_log_id NOT IN (
+                  SELECT rollback_ref FROM strategy_param_apply_log
+                  WHERE rollback_ref IS NOT NULL AND rollback_ref <> ''
+              )
+            ORDER BY created_at DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(x) for x in rows]
 
     def get_monitor(self, days: int = 7) -> Dict[str, Any]:
         days = max(1, int(days))
@@ -618,6 +784,41 @@ class ParamStore:
             (cutoff,),
         ).fetchall()
         apply_stat = {r["status"]: int(r["cnt"]) for r in apply_rows}
+        apply_total = sum(apply_stat.values())
+        rollback_count = int(apply_stat.get("ROLLED_BACK", 0))
+        apply_count = int(apply_stat.get("APPLIED", 0))
+        rollback_rate = (float(rollback_count) / float(apply_total)) if apply_total else 0.0
+        conflict_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM strategy_run_event
+            WHERE created_at >= ? AND module='param' AND action='param_apply'
+              AND status='FAILED' AND (error_msg LIKE '%version conflict%' OR error_code='PARAM_APPLY_CONFLICT')
+            """,
+            (cutoff,),
+        ).fetchone()
+        conflict_count = int(conflict_row["cnt"]) if conflict_row else 0
+        conflict_rate = (float(conflict_count) / float(apply_total)) if apply_total else 0.0
+        fail_dist_rows = self.conn.execute(
+            """
+            SELECT COALESCE(error_code, 'UNKNOWN') AS error_code, COUNT(*) AS cnt
+            FROM strategy_run_event
+            WHERE created_at >= ? AND status='FAILED'
+            GROUP BY COALESCE(error_code, 'UNKNOWN')
+            ORDER BY cnt DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        slow_rows = self.conn.execute(
+            """
+            SELECT module, action, status, duration_ms, created_at
+            FROM strategy_run_event
+            WHERE created_at >= ?
+            ORDER BY duration_ms DESC, created_at DESC
+            LIMIT 20
+            """,
+            (cutoff,),
+        ).fetchall()
         return {
             "days": days,
             "schema_version": self.get_schema_version(),
@@ -627,6 +828,14 @@ class ParamStore:
             "success_rate": (float(success) / float(total)) if total > 0 else 0.0,
             "avg_duration_ms": round(avg_ms, 2),
             "apply_stat": apply_stat,
+            "apply_count": apply_count,
+            "rollback_count": rollback_count,
+            "rollback_rate": rollback_rate,
+            "conflict_count": conflict_count,
+            "conflict_rate": conflict_rate,
+            "failure_distribution": [dict(x) for x in fail_dist_rows],
+            "slow_tasks": [dict(x) for x in slow_rows],
+            "recent_experiments": self.list_experiments(limit=10),
             "recent_failures": [dict(x) for x in recent_failures],
         }
 

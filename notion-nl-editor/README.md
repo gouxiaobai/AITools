@@ -104,6 +104,18 @@ python src\stock_pipeline.py param-apply --proposal-id abc123def456 --editor-jso
 
 # 19) Rollback one apply operation
 python src\stock_pipeline.py param-rollback --apply-log-id 9a8b7c6d5e4f
+
+# 20) Run explicit schema migration/validation for param system
+python src\stock_pipeline.py param-migrate
+
+# 21) Apply with release gate + experiment binding
+python src\stock_pipeline.py param-apply --proposal-id abc123def456 --experiment-id exp123 --require-experiment --gate-min-stability 0.30 --gate-min-hit-rate 0.45 --gate-max-dd-mean 0.20
+
+# 22) Risk guard auto rollback (or preview with --dry-run)
+python src\stock_pipeline.py param-risk-guard --days 7 --min-hit-rate 0.45 --max-drawdown-curve 0.20 --dry-run
+
+# 23) Research stock selection (rule + scoring)
+python src\stock_pipeline.py select-stock --start-date 2026-04-01 --end-date 2026-04-14 --strategies BASELINE,CHAN --markets SH,SZ --top-n 10
 ```
 
 ## Visual Dashboard
@@ -146,6 +158,12 @@ Override by setting env vars in `.env`:
 - `CASH_TOTAL_PNL_FIELD_NAME` (default: `总盈亏`)
 - `CASH_RECONCILE_THRESHOLD` (default: `1.0`，代码结果与Notion公式偏差阈值)
 - `DB_ACCOUNT_CONFIG_ID` / `TOTAL_CAPITAL_FALLBACK` (legacy 兼容，不建议新配置)
+
+## Governance Docs
+
+- `docs/参数治理SOP.md`
+- `docs/研究实验SOP.md`
+- `docs/故障排查手册.md`
 
 现金字段说明：
 - 系统仅从 `DB_CASH_CONFIG_ID` 指向的独立数据库首行读取现金值。

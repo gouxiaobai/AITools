@@ -28,6 +28,7 @@ from stock_pipeline import (  # noqa: E402
     param_recommend,
     param_rollback,
     recommend_prices,
+    select_stock,
     snapshot_daily,
     sync_prices,
     sync_snapshot_notion,
@@ -517,8 +518,8 @@ def main() -> None:
         st.stop()
 
     _show_run_status()
-    tab_signal, tab_backtest, tab_history, tab_param, tab_health = st.tabs(
-        ["交易建议", "回测分析", "历史追踪", "参数调优", "系统健康"]
+    tab_signal, tab_backtest, tab_history, tab_select, tab_param, tab_health = st.tabs(
+        ["交易建议", "回测分析", "历史追踪", "研究选股", "参数调优", "系统健康"]
     )
 
     with tab_signal:
@@ -762,6 +763,13 @@ def main() -> None:
                         rel1, rel2 = st.columns(2)
                         rollout_scope = rel1.text_input("灰度范围", value="full", key="param_rollout_scope")
                         batch_id = rel2.text_input("发布批次ID", value=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}", key="param_batch_id")
+                        gx1, gx2 = st.columns(2)
+                        experiment_id = gx1.text_input("实验ID（发布闸门）", value=str(rec_obj.get("experiment_id", "")), key="param_experiment_id")
+                        require_experiment = gx2.checkbox("发布必须绑定实验", value=True, key="param_require_experiment")
+                        g1, g2, g3 = st.columns(3)
+                        gate_min_stability = g1.number_input("最小稳定性", min_value=0.0, max_value=1.0, value=0.30, step=0.05, key="param_gate_stability")
+                        gate_min_hit_rate = g2.number_input("最小命中率", min_value=0.0, max_value=1.0, value=0.45, step=0.05, key="param_gate_hit")
+                        gate_max_dd = g3.number_input("最大均值回撤", min_value=0.0, max_value=1.0, value=0.20, step=0.05, key="param_gate_dd")
                         confirm_apply = st.checkbox("我确认应用以上参数变更", value=False, key="param_confirm_apply")
                         ap1, ap2 = st.columns(2)
                         if ap1.button("应用参数", type="primary", use_container_width=True, disabled=not confirm_apply):
@@ -773,6 +781,11 @@ def main() -> None:
                                 comment="dashboard_apply",
                                 batch_id=batch_id,
                                 rollout_scope=rollout_scope,
+                                experiment_id=experiment_id,
+                                require_experiment=require_experiment,
+                                gate_min_stability=float(gate_min_stability),
+                                gate_min_hit_rate=float(gate_min_hit_rate),
+                                gate_max_dd_mean=float(gate_max_dd),
                             )
                             a_code, a_raw, a_parsed, a_err = _run_and_capture(param_apply, apply_args)
                             if a_err or a_code != 0:
@@ -803,6 +816,45 @@ def main() -> None:
                                 st.session_state["param_last_apply"] = rb_parsed
                                 _show_json_debug("参数回滚结果", rb_raw)
 
+    with tab_select:
+        st.subheader("研究选股（规则+打分）")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        s1, s2 = st.columns(2)
+        ss_start = s1.text_input("回看开始日期", value=today_str, key="sel_start")
+        ss_end = s2.text_input("回看结束日期", value=today_str, key="sel_end")
+        s3, s4, s5 = st.columns(3)
+        ss_strategy = s3.multiselect("策略过滤", options=["BASELINE", "CHAN", "ATR_WAVE"], default=["BASELINE", "CHAN", "ATR_WAVE"])
+        ss_market = s4.multiselect("市场过滤", options=["SH", "SZ", "HK", "US", "OTHER"], default=[])
+        ss_topn = s5.number_input("Top N", min_value=1, max_value=50, value=10, step=1)
+        ss_min_samples = st.number_input("最小样本数", min_value=1, max_value=60, value=5, step=1)
+        if st.button("执行选股打分", type="primary", use_container_width=True):
+            sel_args = argparse.Namespace(
+                start_date=ss_start,
+                end_date=ss_end,
+                strategies=",".join(ss_strategy),
+                markets=",".join(ss_market),
+                top_n=int(ss_topn),
+                min_samples=int(ss_min_samples),
+            )
+            code, raw, parsed, run_err = _run_and_capture(select_stock, sel_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "选股打分失败"
+                st.error(msg)
+                _mark_run("研究选股", False, msg)
+            else:
+                st.success("选股打分完成")
+                _mark_run("研究选股", True, "候选与调仓建议已生成")
+                if isinstance(parsed, dict):
+                    sel = parsed.get("selected", [])
+                    reb = parsed.get("rebalance_plan", [])
+                    if isinstance(sel, list) and sel:
+                        st.subheader("候选股票")
+                        st.dataframe(pd.DataFrame(sel), use_container_width=True, hide_index=True)
+                    if isinstance(reb, list) and reb:
+                        st.subheader("调仓建议")
+                        st.dataframe(pd.DataFrame(reb), use_container_width=True, hide_index=True)
+                _show_json_debug("选股打分结果", raw)
+
     with tab_health:
         st.subheader("系统健康")
         days = st.number_input("统计窗口（天）", min_value=1, max_value=30, value=7, step=1)
@@ -822,6 +874,11 @@ def main() -> None:
                     c2.metric("成功率", f"{float(parsed.get('success_rate', 0.0)):.2%}")
                     c3.metric("失败数", int(parsed.get("event_failed", 0)))
                     c4.metric("平均耗时(ms)", f"{float(parsed.get('avg_duration_ms', 0.0)):.1f}")
+                    t1, t2, t3, t4 = st.columns(4)
+                    t1.metric("发布次数", int(parsed.get("apply_count", 0)))
+                    t2.metric("回滚率", f"{float(parsed.get('rollback_rate', 0.0)):.2%}")
+                    t3.metric("冲突率", f"{float(parsed.get('conflict_rate', 0.0)):.2%}")
+                    t4.metric("回滚次数", int(parsed.get("rollback_count", 0)))
                     apply_stat = parsed.get("apply_stat", {})
                     if isinstance(apply_stat, dict) and apply_stat:
                         st.subheader("参数发布状态")
@@ -831,6 +888,14 @@ def main() -> None:
                     if isinstance(failures, list) and failures:
                         st.subheader("最近失败任务")
                         st.dataframe(pd.DataFrame(failures), use_container_width=True, hide_index=True)
+                    fail_dist = parsed.get("failure_distribution", [])
+                    if isinstance(fail_dist, list) and fail_dist:
+                        st.subheader("失败分布（按错误码）")
+                        st.dataframe(pd.DataFrame(fail_dist), use_container_width=True, hide_index=True)
+                    slow_tasks = parsed.get("slow_tasks", [])
+                    if isinstance(slow_tasks, list) and slow_tasks:
+                        st.subheader("慢任务Top")
+                        st.dataframe(pd.DataFrame(slow_tasks), use_container_width=True, hide_index=True)
                 _show_json_debug("系统健康结果", raw)
 
     st.markdown("---")
