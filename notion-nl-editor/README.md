@@ -116,6 +116,19 @@ python src\stock_pipeline.py param-risk-guard --days 7 --min-hit-rate 0.45 --max
 
 # 23) Research stock selection (rule + scoring)
 python src\stock_pipeline.py select-stock --start-date 2026-04-01 --end-date 2026-04-14 --strategies BASELINE,CHAN --markets SH,SZ --top-n 10
+
+# 24) Sync full-market tradable universe (A-share + BJ by default)
+python src\stock_pipeline.py sync-market-universe --list-status L --markets SH,SZ,BJ
+
+# 25) Build market-wide snapshot first, then select
+python src\stock_pipeline.py snapshot-market-daily --snapshot-date 2026-04-14 --strategy-id MARKET_SCAN --markets SH,SZ,BJ --min-bars 60
+python src\stock_pipeline.py select-stock --start-date 2026-04-01 --end-date 2026-04-14 --strategies MARKET_SCAN --markets SH,SZ,BJ --top-n 20
+
+# 26) Manual human filter (include/exclude/watch), persistent in local sqlite
+python src\stock_pipeline.py manual-filter-set --stock-code 600519 --decision include --reason "long-term core position"
+python src\stock_pipeline.py manual-filter-set --stock-code 300750 --decision exclude --reason "manual risk control"
+python src\stock_pipeline.py manual-filter-list
+python src\stock_pipeline.py select-stock --strategies MARKET_SCAN --manual-filter-mode strict
 ```
 
 ## Visual Dashboard
@@ -164,6 +177,7 @@ Override by setting env vars in `.env`:
 - `docs/参数治理SOP.md`
 - `docs/研究实验SOP.md`
 - `docs/故障排查手册.md`
+- `docs/ARCHITECTURE.md`
 
 现金字段说明：
 - 系统仅从 `DB_CASH_CONFIG_ID` 指向的独立数据库首行读取现金值。

@@ -15,24 +15,46 @@ SRC_DIR = os.path.join(ROOT_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from stock_pipeline import (  # noqa: E402
-    NotionClient,
-    backtest_recommendation,
-    history_query,
-    load_cfg,
-    load_dotenv,
+from commands.param import (  # noqa: E402
     param_apply,
     param_diff,
     param_draft_save,
     param_monitor,
     param_recommend,
     param_rollback,
+)
+try:  # noqa: E402
+    from commands.research import (
+        history_query,
+        manual_filter_list,
+        manual_filter_set,
+        select_stock,
+        snapshot_market_daily,
+        sync_market_universe,
+    )
+except ImportError:  # backward-compatible fallback for stale module cache
+    from commands.research import history_query, select_stock  # type: ignore
+
+    def _missing_research_feature(*_args, **_kwargs):
+        raise RuntimeError(
+            "当前 commands.research 未加载到全市场/人工筛选能力，请重启 Streamlit；"
+            "若仍失败，执行: python -m py_compile src\\commands\\research.py"
+        )
+
+    manual_filter_list = _missing_research_feature
+    manual_filter_set = _missing_research_feature
+    snapshot_market_daily = _missing_research_feature
+    sync_market_universe = _missing_research_feature
+from commands.signal import (  # noqa: E402
+    backtest_recommendation,
     recommend_prices,
-    select_stock,
     snapshot_daily,
     sync_prices,
     sync_snapshot_notion,
 )
+from core.config import load_cfg  # noqa: E402
+from core.env_utils import load_dotenv  # noqa: E402
+from core.notion_client import NotionClient  # noqa: E402
 
 
 def _run_and_capture(fn, *args, **kwargs) -> Tuple[int, str, Optional[Any], Optional[str]]:
@@ -163,9 +185,16 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
             "holding_shares_now",
             "market_value_now",
             "unrealized_pnl_now",
+            "reliability_score",
+            "risk_regime",
+            "degradation_flag",
+            "execution_feasibility",
+            "signal_strength",
         ]:
             if col not in df.columns:
                 df[col] = None
+        if "suggest_position_band" not in df.columns:
+            df["suggest_position_band"] = {}
 
         df["action"] = df["action"].astype(str).str.upper()
         df["confidence"] = df["confidence"].astype(str).str.upper()
@@ -193,23 +222,39 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
         conf_filter = f2.multiselect("置信度", options=["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"], key="rec_conf_filter")
         keyword = f3.text_input("关键词（股票名/代码）", value="", key="rec_keyword").strip().lower()
         only_exec = f4.checkbox("仅看可执行建议", value=False, key="rec_only_exec")
+        f5, f6, f7 = st.columns([1.2, 1.6, 1.2])
+        min_rel = f5.slider("最小可靠性", min_value=0.0, max_value=1.0, value=0.45, step=0.05, key="rec_min_reliability")
+        exec_filter = f6.multiselect(
+            "执行可行性",
+            options=["TRADEABLE", "CAUTION", "OBSERVE_ONLY"],
+            default=["TRADEABLE", "CAUTION", "OBSERVE_ONLY"],
+            key="rec_exec_filter",
+        )
+        only_non_degraded = f7.checkbox("仅看非退化信号", value=False, key="rec_only_non_degraded")
         show_all_strategies = st.checkbox("展开全部策略（默认仅显示 BASELINE）", value=False, key="rec_show_all_strategy")
 
         fdf = df[df["action"].isin(action_filter) & df["confidence"].isin(conf_filter)].copy()
+        fdf["reliability_score"] = pd.to_numeric(fdf["reliability_score"], errors="coerce").fillna(0.0)
+        fdf["degradation_flag"] = fdf["degradation_flag"].fillna(False).astype(bool)
+        fdf["execution_feasibility"] = fdf["execution_feasibility"].astype(str).str.upper()
+        fdf = fdf[(fdf["reliability_score"] >= float(min_rel)) & (fdf["execution_feasibility"].isin(exec_filter))]
         if keyword:
             fdf = fdf[
                 fdf["stock_name"].str.lower().str.contains(keyword, na=False)
                 | fdf["stock_code"].str.lower().str.contains(keyword, na=False)
             ]
+        if only_non_degraded:
+            fdf = fdf[~fdf["degradation_flag"]]
         if only_exec:
             fdf = fdf[fdf["is_executable"]]
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("建议总数", int(len(fdf)))
         c2.metric("BUY", int((fdf["action"] == "BUY").sum()))
         c3.metric("SELL", int((fdf["action"] == "SELL").sum()))
         c4.metric("HOLD", int((fdf["action"] == "HOLD").sum()))
         c5.metric("高优先机会", int((fdf["action"].isin(["BUY", "SELL"]) & fdf["confidence"].isin(["HIGH", "MEDIUM"])).sum()))
+        c6.metric("平均可靠性", f"{float(fdf['reliability_score'].mean() if len(fdf) else 0.0):.3f}")
 
         st.caption("操作提示：BUY 可考虑分批建仓；SELL 可考虑减仓/止盈；HOLD 等待触发区间。")
 
@@ -235,7 +280,12 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
                     action_text = f":red[{a}]"
                 else:
                     action_text = f":gray[{a}]"
-                st.markdown(f"**{stock_key}**  ·  动作 {action_text}  ·  置信度 `{str(primary.get('confidence', ''))}`")
+                st.markdown(
+                    f"**{stock_key}**  ·  动作 {action_text}  ·  置信度 `{str(primary.get('confidence', ''))}`  ·  可靠性 `{float(primary.get('reliability_score', 0.0) or 0.0):.3f}`"
+                )
+                st.caption(
+                    f"状态: {str(primary.get('risk_regime', 'UNKNOWN'))} | 可行性: {str(primary.get('execution_feasibility', 'UNKNOWN'))} | 退化: {'是' if bool(primary.get('degradation_flag', False)) else '否'}"
+                )
 
                 for _, row in show_rows.iterrows():
                     strategy = str(row.get("strategy_id", ""))
@@ -264,8 +314,15 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
                     reason = str(row.get("reason", "")).strip()
                     mode = str(row.get("mode", "")).strip()
                     size_note = str(row.get("sizing_note", "")).strip()
+                    rel = float(row.get("reliability_score", 0.0) or 0.0)
+                    regime = str(row.get("risk_regime", "UNKNOWN"))
+                    feas = str(row.get("execution_feasibility", "UNKNOWN"))
+                    band_obj = row.get("suggest_position_band", {}) if isinstance(row.get("suggest_position_band", {}), dict) else {}
+                    band_min = float(band_obj.get("min", 0.0) or 0.0)
+                    band_max = float(band_obj.get("max", 0.0) or 0.0)
                     note = f"模式: {mode or '-'}；理由: {reason or '-'}"
                     st.caption(note)
+                    st.caption(f"可靠性: {rel:.3f} | 风险状态: {regime} | 执行可行性: {feas} | 仓位建议区间: [{band_min:.3f}, {band_max:.3f}]")
                     if size_note:
                         st.caption(f"股数换算: {size_note}")
                     if not (pd.notna(buy) and pd.notna(sell) and pd.notna(stop)):
@@ -289,6 +346,10 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
                                 "confidence",
                                 "mode",
                                 "sample_count",
+                                "reliability_score",
+                                "risk_regime",
+                                "execution_feasibility",
+                                "degradation_flag",
                                 "reason",
                             ]
                         ]
@@ -315,6 +376,10 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
                 "unrealized_pnl_now",
                 "confidence",
                 "sample_count",
+                "reliability_score",
+                "risk_regime",
+                "execution_feasibility",
+                "degradation_flag",
                 "mode",
                 "reason",
                 "is_executable",
@@ -337,6 +402,10 @@ def _render_recommend_result(parsed: Optional[Any], raw: str) -> None:
                 "unrealized_pnl_now": "当前浮动盈亏",
                 "confidence": "置信度",
                 "sample_count": "样本数",
+                "reliability_score": "可靠性分数",
+                "risk_regime": "风险状态",
+                "execution_feasibility": "执行可行性",
+                "degradation_flag": "退化信号",
                 "mode": "模式",
                 "reason": "理由",
                 "is_executable": "可执行",
@@ -367,6 +436,8 @@ def _render_backtest_result(parsed: Optional[Any], raw: str) -> None:
         strategy_all = parsed.get("strategy_all", {}) if isinstance(parsed.get("strategy_all"), dict) else {}
         strategy_metrics = parsed.get("strategy_metrics", {}) if isinstance(parsed.get("strategy_metrics"), dict) else {}
         strategy_by_mode = parsed.get("strategy_by_mode", {}) if isinstance(parsed.get("strategy_by_mode"), dict) else {}
+        benchmarks = parsed.get("benchmarks", {}) if isinstance(parsed.get("benchmarks"), dict) else {}
+        exec_constraints = parsed.get("execution_constraints", {}) if isinstance(parsed.get("execution_constraints"), dict) else {}
         source = str(parsed.get("data_source", "unknown")).upper()
 
         st.caption(f"数据源: `{source}`")
@@ -448,6 +519,41 @@ def _render_backtest_result(parsed: Optional[Any], raw: str) -> None:
                     hide_index=True,
                 )
                 st.bar_chart(mdf.set_index("模式")[["Sharpe-like", "平均收益"]])
+
+        if benchmarks:
+            st.subheader("基准对照")
+            b_rows: List[Dict[str, Any]] = []
+            for name, metric in benchmarks.items():
+                if not isinstance(metric, dict):
+                    continue
+                b_rows.append(
+                    {
+                        "基准": name,
+                        "平均收益": float(metric.get("mean", 0.0)),
+                        "Sharpe-like": float(metric.get("sharpe_like", 0.0)),
+                        "最大回撤": float(metric.get("max_drawdown", 0.0)),
+                        "样本数": int(float(metric.get("count", 0.0))),
+                    }
+                )
+            if b_rows:
+                bdf = pd.DataFrame(b_rows).sort_values(by="Sharpe-like", ascending=False)
+                st.dataframe(
+                    bdf.style.format({"平均收益": "{:.4%}", "Sharpe-like": "{:.4f}", "最大回撤": "{:.4%}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.bar_chart(bdf.set_index("基准")[["Sharpe-like", "平均收益"]])
+
+        if exec_constraints:
+            st.subheader("执行约束参数")
+            e1, e2, e3 = st.columns(3)
+            e1.metric("执行延迟(天)", int(exec_constraints.get("delay_days", 0)))
+            e2.metric("交易成本(bps)", f"{float(exec_constraints.get('cost_bps', 0.0)):.1f}")
+            e3.metric("滑点(bps)", f"{float(exec_constraints.get('slippage_bps', 0.0)):.1f}")
+            e4, e5, e6 = st.columns(3)
+            e4.metric("最小交易手数", int(exec_constraints.get("min_trade_lot", 0)))
+            e5.metric("涨跌停阈值", f"{float(exec_constraints.get('limit_move_pct', 0.0)):.2%}")
+            e6.metric("停牌跳空阈值", f"{float(exec_constraints.get('halt_move_pct', 0.0)):.2%}")
     _show_json_debug("回测结果", raw)
 
 
@@ -572,6 +678,14 @@ def main() -> None:
     with tab_backtest:
         st.subheader("回测分析")
         window = st.number_input("回测窗口（交易事件）", min_value=10, max_value=240, value=60, step=5, key="backtest_window")
+        b1, b2, b3 = st.columns(3)
+        exec_delay_days = b1.number_input("执行延迟(天)", min_value=0, max_value=5, value=1, step=1, key="backtest_exec_delay_days")
+        cost_bps = b2.number_input("交易成本(bps)", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="backtest_cost_bps")
+        slippage_bps = b3.number_input("滑点(bps)", min_value=0.0, max_value=30.0, value=2.0, step=0.5, key="backtest_slippage_bps")
+        b4, b5, b6 = st.columns(3)
+        min_trade_lot = b4.number_input("最小交易手数", min_value=1, max_value=1000, value=100, step=1, key="backtest_min_trade_lot")
+        limit_move_pct = b5.number_input("涨跌停阈值(%)", min_value=1.0, max_value=20.0, value=9.8, step=0.1, key="backtest_limit_move_pct")
+        halt_move_pct = b6.number_input("停牌跳空阈值(%)", min_value=5.0, max_value=40.0, value=18.0, step=0.5, key="backtest_halt_move_pct")
         allow_small_sample_bt = st.toggle("允许小样本", value=True, key="backtest_allow_small_sample")
         if st.button("执行回测", type="primary", use_container_width=True, key="backtest_run"):
             bt_args = argparse.Namespace(
@@ -579,6 +693,12 @@ def main() -> None:
                 allow_small_sample=allow_small_sample_bt,
                 min_confidence=min_conf,
                 strategy_set=",".join(strategy_set),
+                execution_delay_days=int(exec_delay_days),
+                cost_bps=float(cost_bps),
+                slippage_bps=float(slippage_bps),
+                min_trade_lot=int(min_trade_lot),
+                limit_move_pct=float(limit_move_pct) / 100.0,
+                halt_move_pct=float(halt_move_pct) / 100.0,
             )
             code, raw, parsed, run_err = _run_and_capture(backtest_recommendation, client, cfg, bt_args)
             if run_err or code != 0:
@@ -631,6 +751,48 @@ def main() -> None:
                 _mark_run("同步快照Notion", True, "Notion 策略快照库已更新")
                 st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
                 _show_json_debug("Notion 同步结果", raw)
+
+        st.markdown("#### 市场级快照联动（全市场选股）")
+        st.caption("如需从全市场直接选股，可在此直接生成 MARKET_SCAN 快照。")
+        hm1, hm2 = st.columns(2)
+        hm_snapshot_date = hm1.text_input("市场快照日期", value=snapshot_date, key="history_market_snapshot_date")
+        hm_strategy_id = hm2.text_input("市场快照策略ID", value="MARKET_SCAN", key="history_market_strategy_id")
+        hm3, hm4, hm5 = st.columns(3)
+        hm_markets = hm3.multiselect("市场范围", options=["SH", "SZ", "BJ"], default=["SH", "SZ", "BJ"], key="history_market_markets")
+        hm_min_bars = hm4.number_input("最少K线数", min_value=20, max_value=400, value=60, step=10, key="history_market_min_bars")
+        hm_adj = hm5.selectbox("复权口径", options=["raw", "qfq", "hfq"], index=0, key="history_market_adj")
+        hm6, hm7 = st.columns(2)
+        hm_sync_missing = hm6.checkbox("缺失K线自动补拉", value=True, key="history_market_sync_missing")
+        hm_dry = hm7.checkbox("仅预览", value=False, key="history_market_dry_run")
+        if st.button("生成市场级快照（联动）", use_container_width=True, key="history_market_snapshot_run"):
+            hm_args = argparse.Namespace(
+                snapshot_date=hm_snapshot_date,
+                start_date="",
+                end_date=hm_snapshot_date,
+                markets=",".join(hm_markets),
+                strategy_id=hm_strategy_id,
+                min_bars=int(hm_min_bars),
+                adj=hm_adj,
+                include_inactive=False,
+                sync_missing=bool(hm_sync_missing),
+                dry_run=bool(hm_dry),
+            )
+            code, raw, parsed, run_err = _run_and_capture(snapshot_market_daily, hm_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "市场级快照联动失败"
+                st.error(msg)
+                _mark_run("市场级快照(联动)", False, msg)
+            else:
+                st.success("市场级快照联动完成，可直接切到“研究选股”执行评分。")
+                _mark_run("市场级快照(联动)", True, "全市场快照已更新")
+                if isinstance(parsed, dict):
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("股票池总数", int(parsed.get("universe_total", 0)))
+                    m2.metric("符合样本", int(parsed.get("qualified_rows", 0)))
+                    m3.metric("入库快照", int(parsed.get("upserted", 0)))
+                    m4.metric("补拉K线数", int(parsed.get("synced_missing_symbols", 0)))
+                    st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("市场级快照联动结果", raw)
 
         st.markdown("---")
         st.subheader("历史查询")
@@ -846,26 +1008,151 @@ def main() -> None:
                                 _show_json_debug("参数回滚结果", rb_raw)
 
     with tab_select:
-        st.subheader("研究选股（规则+打分）")
+        st.subheader("研究选股（全市场+人工筛选）")
         today_str = datetime.now().strftime("%Y-%m-%d")
+        st.markdown("### 1) 全市场股票池同步")
+        u1, u2 = st.columns(2)
+        uni_status = u1.selectbox(
+            "上市状态",
+            options=["L", "S", "P"],
+            index=0,
+            help="L=上市中，S=暂停上市，P=退市",
+            key="select_universe_status",
+        )
+        uni_markets = u2.multiselect(
+            "市场范围（股票池）",
+            options=["SH", "SZ", "BJ"],
+            default=["SH", "SZ", "BJ"],
+            key="select_universe_markets",
+        )
+        if st.button("同步全市场股票池", use_container_width=True, key="select_universe_sync"):
+            uni_args = argparse.Namespace(list_status=uni_status, markets=",".join(uni_markets))
+            code, raw, parsed, run_err = _run_and_capture(sync_market_universe, uni_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "全市场股票池同步失败"
+                st.error(msg)
+                _mark_run("全市场股票池同步", False, msg)
+            else:
+                st.success("全市场股票池同步完成")
+                _mark_run("全市场股票池同步", True, "股票池已更新")
+                if isinstance(parsed, dict):
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("拉取条数", int(parsed.get("fetched", 0)))
+                    m2.metric("入库条数", int(parsed.get("upserted", 0)))
+                    m3.metric("状态", str(parsed.get("list_status", "L")))
+                    st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("全市场股票池同步结果", raw)
+
+        st.markdown("---")
+        st.markdown("### 2) 生成市场级快照")
+        sm1, sm2 = st.columns(2)
+        ms_snapshot_date = sm1.text_input("快照日期", value=today_str, key="select_market_snapshot_date")
+        ms_strategy = sm2.text_input("快照策略ID", value="MARKET_SCAN", key="select_market_strategy_id")
+        sm3, sm4, sm5 = st.columns(3)
+        ms_start = sm3.text_input("K线开始日期（可空）", value="", key="select_market_start_date")
+        ms_end = sm4.text_input("K线结束日期（可空）", value=today_str, key="select_market_end_date")
+        ms_min_bars = sm5.number_input("最少K线数", min_value=20, max_value=400, value=60, step=10, key="select_market_min_bars")
+        sm6, sm7, sm8 = st.columns(3)
+        ms_markets = sm6.multiselect("市场范围（快照）", options=["SH", "SZ", "BJ"], default=["SH", "SZ", "BJ"], key="select_market_markets")
+        ms_adj = sm7.selectbox("复权口径", options=["raw", "qfq", "hfq"], index=0, key="select_market_adj")
+        ms_include_inactive = sm8.checkbox("包含非活跃标的", value=False, key="select_market_include_inactive")
+        sm9, sm10 = st.columns(2)
+        ms_sync_missing = sm9.checkbox("缺失K线时自动补拉", value=True, key="select_market_sync_missing")
+        ms_dry = sm10.checkbox("仅预览（dry-run）", value=False, key="select_market_dry_run")
+        if st.button("生成市场级快照", type="primary", use_container_width=True, key="select_market_snapshot_run"):
+            snapshot_args = argparse.Namespace(
+                snapshot_date=ms_snapshot_date,
+                start_date=ms_start,
+                end_date=ms_end,
+                markets=",".join(ms_markets),
+                strategy_id=ms_strategy,
+                min_bars=int(ms_min_bars),
+                adj=ms_adj,
+                include_inactive=bool(ms_include_inactive),
+                sync_missing=bool(ms_sync_missing),
+                dry_run=bool(ms_dry),
+            )
+            code, raw, parsed, run_err = _run_and_capture(snapshot_market_daily, snapshot_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "市场级快照生成失败"
+                st.error(msg)
+                _mark_run("市场级快照", False, msg)
+            else:
+                st.success("市场级快照生成完成")
+                _mark_run("市场级快照", True, "可用于全市场选股")
+                if isinstance(parsed, dict):
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("股票池总数", int(parsed.get("universe_total", 0)))
+                    m2.metric("符合样本", int(parsed.get("qualified_rows", 0)))
+                    m3.metric("入库快照", int(parsed.get("upserted", 0)))
+                    m4.metric("补拉K线数", int(parsed.get("synced_missing_symbols", 0)))
+                    st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("市场级快照结果", raw)
+
+        st.markdown("---")
+        st.markdown("### 3) 人工筛选规则")
+        mf0, mf1, mf2 = st.columns(3)
+        mf_stock_code = mf0.text_input("股票代码", value="", placeholder="如 600519", key="select_manual_filter_stock_code")
+        mf_decision = mf1.selectbox("决策", options=["include", "exclude", "watch", "clear"], index=2, key="select_manual_filter_decision")
+        mf_operator = mf2.text_input("操作者", value=os.getenv("OPERATOR", "local_user"), key="select_manual_filter_operator")
+        mf_reason = st.text_input("原因", value="", key="select_manual_filter_reason")
+        ma, mb = st.columns(2)
+        if ma.button("保存人工筛选规则", use_container_width=True, key="select_manual_filter_save"):
+            mf_args = argparse.Namespace(
+                stock_code=mf_stock_code,
+                decision=mf_decision,
+                reason=mf_reason,
+                operator=mf_operator,
+            )
+            code, raw, parsed, run_err = _run_and_capture(manual_filter_set, mf_args)
+            if run_err or code != 0:
+                msg = run_err or raw or "人工筛选规则保存失败"
+                st.error(msg)
+                _mark_run("人工筛选规则", False, msg)
+            else:
+                st.success("人工筛选规则保存完成")
+                _mark_run("人工筛选规则", True, "规则已更新")
+                st.dataframe(_as_df(parsed), use_container_width=True, hide_index=True)
+                _show_json_debug("人工筛选写入结果", raw)
+        if mb.button("刷新人工筛选列表", use_container_width=True, key="select_manual_filter_refresh"):
+            code, raw, parsed, run_err = _run_and_capture(manual_filter_list, argparse.Namespace())
+            if run_err or code != 0:
+                msg = run_err or raw or "人工筛选列表查询失败"
+                st.error(msg)
+            else:
+                if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+                    rows = parsed.get("rows", [])
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.caption(f"共 {len(rows)} 条人工规则")
+                _show_json_debug("人工筛选列表", raw)
+
+        st.markdown("---")
+        st.markdown("### 4) 执行选股打分")
         s1, s2 = st.columns(2)
         ss_start = s1.text_input("回看开始日期", value=today_str, key="select_start_date")
         ss_end = s2.text_input("回看结束日期", value=today_str, key="select_end_date")
         s3, s4, s5 = st.columns(3)
         ss_strategy = s3.multiselect(
             "策略过滤",
-            options=["BASELINE", "CHAN", "ATR_WAVE"],
-            default=["BASELINE", "CHAN", "ATR_WAVE"],
+            options=["BASELINE", "CHAN", "ATR_WAVE", "MARKET_SCAN"],
+            default=["MARKET_SCAN"],
             key="select_filter_strategy",
         )
         ss_market = s4.multiselect(
             "市场过滤",
-            options=["SH", "SZ", "HK", "US", "OTHER"],
-            default=[],
+            options=["SH", "SZ", "BJ", "HK", "US", "OTHER"],
+            default=["SH", "SZ", "BJ"],
             key="select_filter_market",
         )
         ss_topn = s5.number_input("Top N", min_value=1, max_value=50, value=10, step=1, key="select_top_n")
         ss_min_samples = st.number_input("最小样本数", min_value=1, max_value=60, value=5, step=1, key="select_min_samples")
+        ss_manual_mode = st.selectbox(
+            "人工筛选模式",
+            options=["strict", "overlay", "off"],
+            index=0,
+            help="strict=人工include优先且exclude剔除；overlay=只剔除exclude；off=不使用人工筛选",
+            key="select_manual_mode",
+        )
         if st.button("执行选股打分", type="primary", use_container_width=True, key="select_run"):
             sel_args = argparse.Namespace(
                 start_date=ss_start,
@@ -874,6 +1161,7 @@ def main() -> None:
                 markets=",".join(ss_market),
                 top_n=int(ss_topn),
                 min_samples=int(ss_min_samples),
+                manual_filter_mode=ss_manual_mode,
             )
             code, raw, parsed, run_err = _run_and_capture(select_stock, sel_args)
             if run_err or code != 0:
@@ -884,8 +1172,18 @@ def main() -> None:
                 st.success("选股打分完成")
                 _mark_run("研究选股", True, "候选与调仓建议已生成")
                 if isinstance(parsed, dict):
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("候选数", int(parsed.get("candidate_count", 0)))
+                    k2.metric("入选数", int(parsed.get("selected_count", 0)))
+                    k3.metric("TopN", int(parsed.get("top_n", 0)))
+                    k4.metric("人工模式", str(parsed.get("manual_filter_mode", ss_manual_mode)))
                     sel = parsed.get("selected", [])
                     reb = parsed.get("rebalance_plan", [])
+                    cand = parsed.get("candidates", [])
+                    if isinstance(cand, list) and cand:
+                        st.subheader("候选池（含人工标签）")
+                        cand_df = pd.DataFrame(cand)
+                        st.dataframe(cand_df, use_container_width=True, hide_index=True)
                     if isinstance(sel, list) and sel:
                         st.subheader("候选股票")
                         st.dataframe(pd.DataFrame(sel), use_container_width=True, hide_index=True)

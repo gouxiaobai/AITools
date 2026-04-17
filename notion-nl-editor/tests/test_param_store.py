@@ -117,6 +117,16 @@ class ParamStoreTest(unittest.TestCase):
         )
         self.assertEqual(out["experiment_id"], exp["experiment_id"])
 
+    def test_proposal_validation_contains_robustness_fields(self) -> None:
+        proposal_id = self._create_one_proposal()
+        proposal = self.store.get_proposal(proposal_id)
+        validation = proposal.get("validation", {})
+        self.assertIn("stability", validation)
+        self.assertIn("benchmark_mean", validation)
+        self.assertIn("benchmark_delta", validation)
+        self.assertIn("regime_consistency", validation)
+        self.assertIn("execution_feasibility_ratio", validation)
+
     def test_monitor_metrics(self) -> None:
         self.store.log_event(module="param", action="x", status="SUCCESS", duration_ms=10)
         self.store.log_event(module="param", action="x", status="FAILED", duration_ms=20, error_code="E1", error_msg="oops")

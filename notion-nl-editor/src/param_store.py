@@ -329,6 +329,13 @@ class ParamStore:
             hit_rate = sum(float(x.get("hit_flag", 0) or 0) for x in items) / n
             mean_ret = sum(returns) / n
             dd_mean = sum(float(x.get("max_drawdown", 0.0) or 0.0) for x in items) / n
+            split_n = max(1, n // 3)
+            train_returns = returns[:split_n]
+            valid_returns = returns[split_n : split_n * 2]
+            test_returns = returns[split_n * 2 :]
+            train_mean = sum(train_returns) / len(train_returns) if train_returns else 0.0
+            valid_mean = sum(valid_returns) / len(valid_returns) if valid_returns else 0.0
+            test_mean = sum(test_returns) / len(test_returns) if test_returns else 0.0
 
             chunk = max(1, n // max(1, int(walk_forward_splits)))
             wf_scores: List[float] = []
@@ -338,6 +345,22 @@ class ParamStore:
                     wf_scores.append(sum(w) / len(w))
             stability = 1.0 - min(1.0, (max(wf_scores) - min(wf_scores)) / (abs(mean_ret) + 1e-6)) if wf_scores else 0.0
             score = mean_ret * 100.0 + hit_rate * 10.0 - dd_mean * 50.0 + stability * 2.0
+            momentum_benchmark = []
+            for i in range(1, len(returns)):
+                momentum_benchmark.append(returns[i] if returns[i - 1] >= 0 else -returns[i])
+            benchmark_random = [r if (i % 2 == 0) else -r for i, r in enumerate(returns)]
+            benchmark_proxy = returns
+            benchmark_mean = {
+                "index_proxy": (sum(benchmark_proxy) / len(benchmark_proxy)) if benchmark_proxy else 0.0,
+                "momentum": (sum(momentum_benchmark) / len(momentum_benchmark)) if momentum_benchmark else 0.0,
+                "random": (sum(benchmark_random) / len(benchmark_random)) if benchmark_random else 0.0,
+            }
+            benchmark_delta = mean_ret - max(benchmark_mean.values()) if benchmark_mean else mean_ret
+            regimes = [str(x.get("risk_regime", "") or "") for x in items if str(x.get("risk_regime", "") or "")]
+            major_regime = max(set(regimes), key=regimes.count) if regimes else ""
+            regime_consistency = (regimes.count(major_regime) / len(regimes)) if regimes else 0.0
+            execution_flags = [str(x.get("execution_feasibility", "") or "") for x in items]
+            execution_feasibility_ratio = (sum(1 for x in execution_flags if x in {"TRADEABLE", "CAUTION"}) / len(execution_flags)) if execution_flags else 0.0
 
             current_params, base_version = self._load_param_set(strategy_id, market, symbol_scope)
             proposed = dict(current_params)
@@ -357,7 +380,14 @@ class ParamStore:
                 "cost_bps": float(cost_bps),
                 "slippage_bps": float(slippage_bps),
                 "stability": round(stability, 6),
+                "train_mean": round(train_mean, 6),
+                "valid_mean": round(valid_mean, 6),
+                "test_mean": round(test_mean, 6),
                 "wf_scores": [round(x, 6) for x in wf_scores],
+                "benchmark_mean": {k: round(v, 6) for k, v in benchmark_mean.items()},
+                "benchmark_delta": round(benchmark_delta, 6),
+                "regime_consistency": round(regime_consistency, 6),
+                "execution_feasibility_ratio": round(execution_feasibility_ratio, 6),
             }
             row = {
                 "proposal_id": proposal_id,
