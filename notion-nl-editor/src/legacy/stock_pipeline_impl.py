@@ -1063,7 +1063,7 @@ def _is_account_row(row: Dict[str, Any], stock_fields: Dict[str, Optional[str]])
 def _resolve_cash_config_fields(cash_db: Dict[str, Any], pref_name: str) -> Dict[str, Optional[str]]:
     props = cash_db.get("properties", {})
     return {
-        "cash": _find_prop_name(props, [pref_name, "可流动现金", "现金", "cash"], ["number", "rich_text", "title"]),
+        "cash": _find_prop_name(props, [pref_name, "可流动现金", "现金", "cash"], ["number", "formula", "rollup", "rich_text", "title"]),
     }
 
 
@@ -1077,6 +1077,18 @@ def _num_from_prop_any(page: Dict[str, Any], key: Optional[str]) -> Optional[flo
     if typ == "number":
         num = prop.get("number")
         return float(num) if num is not None else None
+    if typ == "formula":
+        formula = prop.get("formula", {})
+        if formula.get("type") == "number":
+            num = formula.get("number")
+            return float(num) if num is not None else None
+        return None
+    if typ == "rollup":
+        rollup = prop.get("rollup", {})
+        if rollup.get("type") == "number":
+            num = rollup.get("number")
+            return float(num) if num is not None else None
+        return None
     if typ in {"rich_text", "title"}:
         text = _prop_text_any(page, key).replace(",", "").strip()
         if not text:
@@ -1102,7 +1114,7 @@ def _load_cash_from_config_db(client: NotionClient, cfg: Cfg) -> float:
     if not rows:
         raise RuntimeError("Cash config DB has no records.")
     val = _num_from_prop_any(rows[0], key)
-    if val is not None and val > 0:
+    if val is not None:
         return float(val)
     fallback = os.getenv("TOTAL_CASH_FALLBACK", "").replace(",", "").strip()
     if fallback:
