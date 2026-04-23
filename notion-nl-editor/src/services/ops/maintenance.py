@@ -1,6 +1,7 @@
 import argparse
 import datetime as dt
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -106,6 +107,7 @@ def _resolve_trade_write_fields(trade_db: Dict[str, Any]) -> Dict[str, Optional[
         "fee": _find_prop_name(props, ["手续费", "费用"], ["number"]),
         "tax": _find_prop_name(props, ["税费", "印花税"], ["number"]),
         "stock": _find_prop_name(props, ["股票"], ["relation"]),
+        "account": _find_prop_name(props, ["账户", "account"], ["relation"]),
         "strategy": _find_prop_name(props, ["策略"], ["select", "status", "rich_text", "title"]),
         "note": _find_prop_name(props, ["备注"], ["rich_text", "title"]),
         "source_table": _find_prop_name(props, ["source_table"], ["select", "status"]),
@@ -139,6 +141,263 @@ def _write_prop_value(db_props: Dict[str, Dict[str, Any]], prop_name: str, value
     if typ == "title":
         return title_prop(_coerce_text(value))
     return None
+
+
+def _normalize_lookup_text(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    for ch in [" ", "_", "-", "\t", "\r", "\n"]:
+        text = text.replace(ch, "")
+    return text
+
+
+def _match_keywords(name: str, keywords: List[str]) -> bool:
+    haystack = str(name or "").casefold()
+    return any(str(keyword or "").casefold() in haystack for keyword in keywords if keyword)
+
+
+def _resolve_cash_trade_relation_field(cash_db: Dict[str, Any], std_trades_id: str) -> str:
+    props = cash_db.get("properties", {})
+    override = (os.getenv("CASH_TRADE_RELATION_FIELD_NAME", "") or "").strip()
+    if override:
+        info = props.get(override)
+        if not info:
+            raise RuntimeError(f"Cash config relation field not found: {override}")
+        if info.get("type") != "relation":
+            raise RuntimeError(f"Cash config field is not relation: {override}")
+        return override
+
+    relation_props = [(name, info) for name, info in props.items() if info.get("type") == "relation"]
+    if not relation_props:
+        raise RuntimeError("Cash config DB has no relation field for trades.")
+
+    exact_db_matches = [
+        name for name, info in relation_props if (info.get("relation", {}) or {}).get("database_id") == std_trades_id
+    ]
+    if len(exact_db_matches) == 1:
+        return exact_db_matches[0]
+    if len(exact_db_matches) > 1:
+        keyword_matches = [
+            name
+            for name in exact_db_matches
+            if _match_keywords(name, ["交易流水", "流水", "关联交易", "trade", "trades", "transaction", "txn"])
+        ]
+        if len(keyword_matches) == 1:
+            return keyword_matches[0]
+        raise RuntimeError("Cash config DB has multiple trade relation fields.")
+
+    keyword_matches = [
+        name
+        for name, _ in relation_props
+        if _match_keywords(name, ["交易流水", "流水", "关联交易", "trade", "trades", "transaction", "txn"])
+    ]
+    if len(keyword_matches) == 1:
+        return keyword_matches[0]
+    if len(relation_props) == 1:
+        return relation_props[0][0]
+    raise RuntimeError("Unable to resolve cash config trade relation field.")
+
+
+def _resolve_trade_account_relation_field(trade_db: Dict[str, Any], cash_db_id: str) -> Optional[str]:
+    props = trade_db.get("properties", {})
+    override = (os.getenv("TRADE_ACCOUNT_RELATION_FIELD_NAME", "") or "").strip()
+    if override:
+        info = props.get(override)
+        if not info:
+            raise RuntimeError(f"Trade account relation field not found: {override}")
+        if info.get("type") != "relation":
+            raise RuntimeError(f"Trade account field is not relation: {override}")
+        return override
+
+    relation_props = [(name, info) for name, info in props.items() if info.get("type") == "relation"]
+    exact_db_matches = [
+        name for name, info in relation_props if (info.get("relation", {}) or {}).get("database_id") == cash_db_id
+    ]
+    if len(exact_db_matches) == 1:
+        return exact_db_matches[0]
+    if len(exact_db_matches) > 1:
+        keyword_matches = [
+            name
+            for name in exact_db_matches
+            if _match_keywords(name, ["账户", "总账户", "account", "cash config", "cash account"])
+        ]
+        if len(keyword_matches) == 1:
+            return keyword_matches[0]
+        raise RuntimeError("Trade DB has multiple cash-account relation fields.")
+
+    keyword_matches = [
+        name
+        for name, _ in relation_props
+        if _match_keywords(name, ["账户", "总账户", "account", "cash config", "cash account"])
+    ]
+    if len(keyword_matches) == 1:
+        return keyword_matches[0]
+    return None
+
+
+def _is_cash_account_row(row: Dict[str, Any], title_name: Optional[str]) -> bool:
+    targets = {
+        _normalize_lookup_text("ACCOUNT"),
+        _normalize_lookup_text("总账户"),
+        _normalize_lookup_text(os.getenv("ACCOUNT_ROW_CODE", "ACCOUNT")),
+    }
+    texts: List[str] = []
+    if title_name:
+        texts.append(_prop_text_any(row, title_name))
+    for prop_name, prop in row.get("properties", {}).items():
+        if prop.get("type") in {"title", "rich_text", "select", "status"}:
+            texts.append(_prop_text_any(row, prop_name))
+    return any(_normalize_lookup_text(text) in targets for text in texts if text)
+
+
+def _resolve_cash_account_relation_target(client: NotionClient, cfg: Cfg) -> Dict[str, Any]:
+    db_id = (cfg.cash_config_id or "").strip()
+    if not db_id:
+        raise RuntimeError("Missing DB_CASH_CONFIG_ID.")
+
+    cash_db = client.get_database(db_id)
+    relation_prop = _resolve_cash_trade_relation_field(cash_db, cfg.std_trades_id)
+    title_name = find_title_property_name(cash_db)
+    rows = client.query_database_all(db_id)
+    if not rows:
+        raise RuntimeError("Cash config DB has no records.")
+
+    matches = [row for row in rows if _is_cash_account_row(row, title_name)]
+    if len(matches) == 1:
+        row = matches[0]
+    elif len(matches) > 1:
+        raise RuntimeError("Multiple cash config rows matched ACCOUNT/总账户.")
+    elif len(rows) == 1:
+        row = rows[0]
+    else:
+        raise RuntimeError("Cash config account row not found; expected ACCOUNT/总账户.")
+
+    related_ids = p_relation_ids(row, relation_prop)
+    return {
+        "page_id": row.get("id", ""),
+        "relation_prop": relation_prop,
+        "related_ids": list(related_ids),
+    }
+
+
+def _resolve_cash_account_page(client: NotionClient, cfg: Cfg) -> Dict[str, Any]:
+    db_id = (cfg.cash_config_id or "").strip()
+    if not db_id:
+        raise RuntimeError("Missing DB_CASH_CONFIG_ID.")
+
+    cash_db = client.get_database(db_id)
+    title_name = find_title_property_name(cash_db)
+    rows = client.query_database_all(db_id)
+    if not rows:
+        raise RuntimeError("Cash config DB has no records.")
+
+    matches = [row for row in rows if _is_cash_account_row(row, title_name)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError("Multiple cash config rows matched ACCOUNT/总账户.")
+    if len(rows) == 1:
+        return rows[0]
+    raise RuntimeError("Cash config account row not found; expected ACCOUNT/总账户.")
+
+
+def _merge_relation_ids(existing_ids: List[str], new_ids: List[str]) -> Tuple[List[str], int]:
+    merged: List[str] = []
+    seen = set()
+    for rid in list(existing_ids) + list(new_ids):
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        merged.append(rid)
+    return merged, max(len(merged) - len(list(dict.fromkeys(existing_ids))), 0)
+
+
+def _sync_cash_account_relations(
+    client: NotionClient,
+    target: Dict[str, Any],
+    trade_page_ids: List[str],
+) -> int:
+    clean_ids = [rid for rid in trade_page_ids if rid]
+    if not clean_ids:
+        return 0
+    merged_ids, added = _merge_relation_ids(target.get("related_ids", []), clean_ids)
+    if added <= 0:
+        return 0
+    client.update_page(
+        target["page_id"],
+        {
+            target["relation_prop"]: {
+                "relation": [{"id": rid} for rid in merged_ids],
+            }
+        },
+    )
+    target["related_ids"] = merged_ids
+    return added
+
+
+def _resolve_trade_account_target(client: NotionClient, cfg: Cfg, trade_db: Dict[str, Any]) -> Dict[str, str]:
+    cash_page = _resolve_cash_account_page(client, cfg)
+    account_field = _resolve_trade_account_relation_field(trade_db, (cfg.cash_config_id or "").strip())
+    return {
+        "account_field": account_field or "",
+        "cash_page_id": str(cash_page.get("id", "") or ""),
+    }
+
+
+def _attach_trade_account_relation(
+    props: Dict[str, Any],
+    trade_target: Dict[str, str],
+) -> bool:
+    account_field = trade_target.get("account_field", "")
+    cash_page_id = trade_target.get("cash_page_id", "")
+    if not account_field or not cash_page_id:
+        return False
+    props[account_field] = {"relation": [{"id": cash_page_id}]}
+    return True
+
+
+def _backfill_trade_account_relations(
+    client: NotionClient,
+    cfg: Cfg,
+    trade_target: Dict[str, str],
+) -> Dict[str, int]:
+    account_field = trade_target.get("account_field", "")
+    cash_page_id = trade_target.get("cash_page_id", "")
+    if not account_field or not cash_page_id:
+        return {"scanned": 0, "already_linked": 0, "missing_before": 0, "linked": 0}
+
+    trade_rows = client.query_database_all(cfg.std_trades_id)
+    scanned = 0
+    already_linked = 0
+    missing_before = 0
+    linked = 0
+    for row in trade_rows:
+        row_id = str(row.get("id", "") or "")
+        if not row_id:
+            continue
+        scanned += 1
+        current_ids = p_relation_ids(row, account_field)
+        if cash_page_id in current_ids:
+            already_linked += 1
+            continue
+        missing_before += 1
+        merged_ids, added = _merge_relation_ids(current_ids, [cash_page_id])
+        if added <= 0:
+            continue
+        client.update_page(
+            row_id,
+            {
+                account_field: {
+                    "relation": [{"id": rid} for rid in merged_ids],
+                }
+            },
+        )
+        linked += 1
+    return {
+        "scanned": scanned,
+        "already_linked": already_linked,
+        "missing_before": missing_before,
+        "linked": linked,
+    }
 
 
 def audit(client: NotionClient, cfg: Cfg, as_json: bool) -> int:
@@ -331,7 +590,11 @@ def migrate_apply(client: NotionClient, cfg: Cfg, limit: int) -> int:
     if limit > 0:
         todo = todo[:limit]
 
+    trade_db = client.get_database(cfg.std_trades_id)
+    trade_target = _resolve_trade_account_target(client, cfg, trade_db)
+    cash_target = None if trade_target.get("account_field") else _resolve_cash_account_relation_target(client, cfg)
     inserted = 0
+    created_trade_ids: List[str] = []
     for item in todo:
         props: Dict[str, Any] = {
             "璁板綍": title_prop(item["璁板綍"]),
@@ -344,12 +607,19 @@ def migrate_apply(client: NotionClient, cfg: Cfg, limit: int) -> int:
         }
         if item.get("stock_id"):
             props["鑲＄エ"] = {"relation": [{"id": item["stock_id"]}]}
-        client.create_page(cfg.std_trades_id, props)
+        _attach_trade_account_relation(props, trade_target)
+        page = client.create_page(cfg.std_trades_id, props)
+        created_trade_ids.append(page.get("id", ""))
         inserted += 1
         if inserted % 20 == 0:
             print(f"progress {inserted}/{len(todo)}")
         time.sleep(0.12)
 
+    if cash_target is not None:
+        linked = _sync_cash_account_relations(client, cash_target, created_trade_ids)
+        print(f"cash relation linked: {linked}")
+    else:
+        print(f"trade account linked: {len(created_trade_ids)}")
     print(f"导入完成: {inserted} 条")
     return 0
 
@@ -369,6 +639,8 @@ def add_trade(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
 
     title = f"{args.date} {args.direction} {args.stock} {args.shares}@{args.price}"
     trade_db = client.get_database(cfg.std_trades_id)
+    trade_target = _resolve_trade_account_target(client, cfg, trade_db)
+    cash_target = None if trade_target.get("account_field") else _resolve_cash_account_relation_target(client, cfg)
     write_fields = _resolve_trade_write_fields(trade_db)
     db_props = trade_db.get("properties", {})
     props: Dict[str, Any] = {}
@@ -400,9 +672,40 @@ def add_trade(client: NotionClient, cfg: Cfg, args: argparse.Namespace) -> int:
         payload = _write_prop_value(db_props, write_fields["note"], args.note[:2000])
         if payload is not None:
             props[write_fields["note"]] = payload
+    _attach_trade_account_relation(props, trade_target)
 
     page = client.create_page(cfg.std_trades_id, props)
+    if cash_target is not None:
+        linked = _sync_cash_account_relations(client, cash_target, [page.get("id", "")])
+        print(f"cash relation linked: {linked}")
+    elif trade_target.get("account_field"):
+        print("trade account linked: 1")
     print(f"新增交易成功: id={page.get('id')}")
+    return 0
+
+
+def backfill_cash_relations(client: NotionClient, cfg: Cfg) -> int:
+    trade_db = client.get_database(cfg.std_trades_id)
+    trade_target = _resolve_trade_account_target(client, cfg, trade_db)
+    if trade_target.get("account_field"):
+        stats = _backfill_trade_account_relations(client, cfg, trade_target)
+        print(f"trade rows scanned: {stats['scanned']}")
+        print(f"already linked: {stats['already_linked']}")
+        print(f"missing before backfill: {stats['missing_before']}")
+        print(f"linked now: {stats['linked']}")
+        return 0
+
+    cash_target = _resolve_cash_account_relation_target(client, cfg)
+    trade_rows = client.query_database_all(cfg.std_trades_id)
+    trade_ids = [str(row.get("id", "") or "") for row in trade_rows if row.get("id")]
+    existing_ids = set(cash_target.get("related_ids", []))
+    missing_ids = [rid for rid in trade_ids if rid not in existing_ids]
+    linked = _sync_cash_account_relations(client, cash_target, missing_ids)
+
+    print(f"trade rows scanned: {len(trade_ids)}")
+    print(f"already linked: {len(existing_ids)}")
+    print(f"missing before backfill: {len(missing_ids)}")
+    print(f"linked now: {linked}")
     return 0
 
 
@@ -523,6 +826,7 @@ __all__ = [
     "add_trade",
     "annual_sync",
     "audit",
+    "backfill_cash_relations",
     "migrate_apply",
     "migrate_preview",
     "validate_manual_entries",

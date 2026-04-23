@@ -30,6 +30,7 @@ class ArchitectureCompatTest(unittest.TestCase):
             "sync-market-universe",
             "snapshot-market-daily",
             "manual-filter-set",
+            "backfill-cash-relations",
         ]:
             self.assertIn(cmd, help_text)
 

@@ -3,7 +3,7 @@ import os
 import sys
 
 from commands.audit import audit, validate_manual_entries
-from commands.migrate import add_trade, annual_sync, migrate_apply, migrate_preview
+from commands.migrate import add_trade, annual_sync, backfill_cash_relations, migrate_apply, migrate_preview
 from commands.param import (
     param_apply,
     param_diff,
@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_add_trade.add_argument("--tax", type=float, default=0.0)
     cmd_add_trade.add_argument("--strategy", default="")
     cmd_add_trade.add_argument("--note", default="")
+    sub.add_parser("backfill-cash-relations", help="backfill trade relations into cash config account row")
 
     sub.add_parser("validate-manual", help="校验手工记录必填字段")
 
@@ -273,6 +274,8 @@ def main() -> int:
         return migrate_apply(client, cfg, limit=args.limit)
     if args.cmd == "add-trade":
         return add_trade(client, cfg, args)
+    if args.cmd == "backfill-cash-relations":
+        return backfill_cash_relations(client, cfg)
     if args.cmd == "validate-manual":
         return validate_manual_entries(client, cfg)
     if args.cmd == "sync-annual":
